@@ -76,14 +76,18 @@ class Encoder(nn.Module):
         self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
         self.fc = nn.Linear(in_features=8*8*256, out_features=2*latent_size)
+        self.relu = nn.ReLU()
         
     def forward(self, x):
         # input x is (bs, 3, 32, 32) for cifar images
         x = self.conv1(x)
+        x = self.relu(x)
         x = self.max_pool(x)
         x = self.conv2(x)
+        x = self.relu(x)
         x = self.max_pool(x)
         x = self.conv3(x)
+        x = self.relu(x)
 
         x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*256)
         
@@ -100,6 +104,8 @@ class Decoder(nn.Module):
         self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
         self.conv3 = nn.Conv2d(in_channels=128, out_channels=3, kernel_size=5, stride=1, padding=2)
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear")  # do we want upsample of deconv layer?
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
         self.init_size = int(np.sqrt(latent_size))
         
     def forward(self, x):
@@ -107,8 +113,10 @@ class Decoder(nn.Module):
         x = x.reshape(x.shape[0], 1, self.init_size, self.init_size)  # TODO do we want to reshape or view (faster)?
         #x = self.upsample(x)  # do we want to upsample or convolve first?
         x = self.conv1(x)
+        x = self.relu(x)
         x = self.upsample(x) 
         x = self.conv2(x)
+        x = self.relu(x)
         x = self.upsample(x) 
         out = self.conv3(x)
         
@@ -181,7 +189,7 @@ plot_image(reconstructed_image, 'reconstructed_image.png')
 
 # %%
 
-# train
+# train see https://github.com/orybkin/sigma-vae-pytorch
 
 # create optimizer
 optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0.000)
@@ -211,6 +219,8 @@ for epoch in range(10):
         count += 1
         
         if count % 1000 == 0:
+            # to combat vanishing KL loss:
+            args.beta *= 1.5
             print(count, rec_loss.item(), b_loss.item())
             name = f'reconstructed_i{count}_b{args.beta}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}.png'
             vae.eval()
