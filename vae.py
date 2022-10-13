@@ -19,12 +19,18 @@ def get_args_parser(add_help=True):
     parser = argparse.ArgumentParser(description="PyTorch Detection Training", add_help=add_help)
 
     parser.add_argument("--data_dir", default="data", type=str, help="path to save outputs")
-    parser.add_argument("--train_batch_size", default=1, type=int)
-    parser.add_argument("--test_batch_size", default=1, type=int)
+    parser.add_argument("--train_batch_size", default=50, type=int)
+    parser.add_argument("--test_batch_size", default=50, type=int)
+    parser.add_argument("--latent_size", default=64, type=int)
+    parser.add_argument("--print_freq", default=1000, type=int)
+    parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--wd", default=0.0, type=float)
     parser.add_argument("--beta", default=0.01, type=float)
     parser.add_argument("--evaluate", dest="evaluate", help="run FP32 evaluation as baseline", action="store_true")
+    parser.add_argument("--vae", dest="vae", help="use simple autoencoder, not VAE", action="store_true")
+    parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
+    
     
     return parser
 
@@ -49,13 +55,14 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
 
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        ])
+        # transform_test = transforms.Compose([
+        #     transforms.ToTensor(),
+        #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        # ])
+        transform_test = transforms.Compose([transforms.ToTensor(), ])
 
         train_dataset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
@@ -67,15 +74,17 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
 
 
 class Encoder(nn.Module):
-    def __init__(self, latent_size) -> None:
+    def __init__(self, vae=False, latent_size=None) -> None:
         super().__init__()
+        self.vae = vae
+        mult = 2 if vae else 1
         self.latent_size = latent_size
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2)
         self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
         self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=5, stride=1, padding=2)
         self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
-        self.fc = nn.Linear(in_features=8*8*256, out_features=2*latent_size)
+        self.fc = nn.Linear(in_features=8*8*128, out_features=mult*latent_size)
         self.relu = nn.ReLU()
         
     def forward(self, x):
@@ -86,14 +95,17 @@ class Encoder(nn.Module):
         x = self.conv2(x)
         x = self.relu(x)
         x = self.max_pool(x)
-        x = self.conv3(x)
-        x = self.relu(x)
+        # x = self.conv3(x)
+        # x = self.relu(x)
 
         x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*256)
         
         x = self.fc(x)  # should be (bs, 2*latent_size)
         
-        out = x.reshape(x.shape[0], self.latent_size, 2)
+        if self.vae:
+            out = x.reshape(x.shape[0], self.latent_size, 2)
+        else:
+            out = x
         
         return out
     
@@ -101,8 +113,13 @@ class Decoder(nn.Module):
     def __init__(self, latent_size) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=64, kernel_size=5, stride=1, padding=2)  # TODO should we use smaller kernels here?
-        self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
-        self.conv3 = nn.Conv2d(in_channels=128, out_channels=3, kernel_size=5, stride=1, padding=2)
+        if latent_size == 64:
+            self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
+            self.conv3 = nn.Conv2d(in_channels=128, out_channels=3, kernel_size=5, stride=1, padding=2)
+        elif latent_size == 256:
+            self.conv2 = nn.Conv2d(in_channels=64, out_channels=3, kernel_size=5, stride=1, padding=2)
+        else:
+            raise(NotImplementedError)
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear")  # do we want upsample of deconv layer?
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
@@ -116,18 +133,29 @@ class Decoder(nn.Module):
         x = self.relu(x)
         x = self.upsample(x) 
         x = self.conv2(x)
-        x = self.relu(x)
-        x = self.upsample(x) 
-        out = self.conv3(x)
+        if self.init_size == 16:
+            pass
+        elif self.init_size == 8:
+            x = self.relu(x)
+            x = self.upsample(x) 
+            x = self.conv3(x)
+        else:
+            raise(NotImplementedError)
+        
+        if args.sigmoid:
+            out = self.sigmoid(x)
+        else:
+            out = x
         
         return out
         
         
 class VAE(nn.Module):
-    def __init__(self, latent_size=None) -> None:
+    def __init__(self, vae=False, latent_size=None) -> None:
         super().__init__()
-        self.encoder = Encoder(latent_size)
+        self.encoder = Encoder(vae=vae, latent_size=latent_size)
         self.decoder = Decoder(latent_size)
+        self.vae = vae
         self.latent_size = latent_size
         
     
@@ -138,17 +166,21 @@ class VAE(nn.Module):
         # compute reconstruction_loss between decoded and original images
         # compute gaussian_loss between stats vector and Normal distribution stats (mean=0 and std=1)
 
-        self.stats = self.encoder(x)   # stats is a vector (latent_size, 2) with (mean, std) rows 
+        out = self.encoder(x)   # stats is a vector (latent_size, 2) with (mean, std) rows 
         
-        means = self.stats[:, :, 0]
-        stds = self.stats[:, :, 1]
+        if self.vae:
+            self.stats = out
+            means = self.stats[:, :, 0]
+            stds = self.stats[:, :, 1]
         
-        # reparametrization trick: sample a value as mean + std * N(0, 1)
-        self.normal = torch.randn((x.shape[0], self.latent_size), device='cuda')
-        assert self.normal.shape == means.shape == stds.shape
-        latent_vector = means + stds * self.normal
+            # reparametrization trick: sample a value as mean + std * N(0, 1)
+            self.normal = torch.randn((x.shape[0], self.latent_size), device='cuda')
+            assert self.normal.shape == means.shape == stds.shape
+            self.latent_vector = means + stds * self.normal
+        else:
+            self.latent_vector = out
         
-        out = self.decoder(latent_vector)
+        out = self.decoder(self.latent_vector)
         
         return out
 
@@ -166,10 +198,8 @@ train_dataloader, test_dataloader = get_data(
 
 input_image = iter(test_dataloader).next()[0][0].reshape(1, 3, 32, 32)
 
-latent_size = 64
+vae = VAE(vae=args.vae, latent_size=args.latent_size).cuda()
 
-vae = VAE(latent_size=latent_size).cuda()
- 
 reconstructed_image = vae(input_image.cuda())
 
 # %%
@@ -195,38 +225,53 @@ plot_image(reconstructed_image, 'reconstructed_image.png')
 optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0.000)
 
 reconstruction_loss = nn.MSELoss()
-beta_loss = nn.KLDivLoss()
+if args.vae:
+    beta_loss = nn.KLDivLoss()
 
-normal_stats = torch.zeros((args.train_batch_size, latent_size, 2), device='cuda')
-normal_stats[:, :, 1] = 1
+    normal_stats = torch.zeros((args.train_batch_size, args.latent_size, 2), device='cuda')
+    normal_stats[:, :, 1] = 1
 
 count = 0
+total_rec_loss = 0
+total_b_loss = 0
 vae.train()
 
-for epoch in range(10):
-    print(f'\n\nEpoch {epoch}\n\n')
+for epoch in range(args.epochs):
+    print(f'\nEpoch {epoch}\n')
+
     for image, label in train_dataloader:
         image = image.cuda()
         reconstructed = vae(image)
         
         rec_loss = reconstruction_loss(image, reconstructed)
-        b_loss = beta_loss(vae.stats, normal_stats)
-        loss = rec_loss + args.beta * b_loss.abs()
+        total_rec_loss += rec_loss
+        loss = rec_loss
+        
+        if args.vae:
+            b_loss = beta_loss(vae.stats, normal_stats)
+            loss += args.beta * b_loss.abs()
+            total_rec_loss += b_loss
         
         optim.zero_grad()
         loss.backward()
         optim.step()
         count += 1
         
-        if count % 1000 == 0:
+        if count % args.print_freq == 0:
             # to combat vanishing KL loss:
-            args.beta *= 1.5
-            print(count, rec_loss.item(), b_loss.item())
-            name = f'reconstructed_i{count}_b{args.beta}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}.png'
+            if args.vae:
+                args.beta *= 1.5
+            else:
+                args.beta = '_no_vae'
+            print(count, rec_loss.item()/args.print_freq, f'{b_loss.item()/args.print_freq}' if args.vae else '')
+            name = f'reconstructed_i{count}_ls{args.latent_size}_b{args.beta}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}.png'
             vae.eval()
-            reconstructed_image = vae(input_image.cuda())
-            vae.train()
+            with torch.no_grad():
+                reconstructed_image = vae(input_image.cuda())
             plot_image(reconstructed_image, name)
+            vae.train()
+            total_rec_loss = 0
+            total_b_loss = 0
         
 
 # %%
