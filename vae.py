@@ -226,31 +226,33 @@ optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0.000)
 
 reconstruction_loss = nn.MSELoss()
 if args.vae:
-    beta_loss = nn.KLDivLoss()
+    norm_loss = nn.KLDivLoss()
 
     normal_stats = torch.zeros((args.train_batch_size, args.latent_size, 2), device='cuda')
     normal_stats[:, :, 1] = 1
 
 count = 0
 total_rec_loss = 0
-total_b_loss = 0
+total_kl_loss = 0
 vae.train()
+print('\n\n')
 
 for epoch in range(args.epochs):
-    print(f'\nEpoch {epoch}\n')
+    print(f'Epoch {epoch}')
 
     for image, label in train_dataloader:
         image = image.cuda()
         reconstructed = vae(image)
-        
+        if count == 5000:
+            breakpoint()
         rec_loss = reconstruction_loss(image, reconstructed)
         total_rec_loss += rec_loss
         loss = rec_loss
         
         if args.vae:
-            b_loss = beta_loss(vae.stats, normal_stats)
-            loss += args.beta * b_loss.abs()
-            total_rec_loss += b_loss
+            kl_loss = norm_loss(vae.stats, normal_stats)
+            loss += args.beta * kl_loss.abs()
+            total_rec_loss += kl_loss
         
         optim.zero_grad()
         loss.backward()
@@ -263,15 +265,15 @@ for epoch in range(args.epochs):
                 args.beta *= 1.5
             else:
                 args.beta = '_no_vae'
-            print(count, rec_loss.item()/args.print_freq, f'{b_loss.item()/args.print_freq}' if args.vae else '')
-            name = f'reconstructed_i{count}_ls{args.latent_size}_b{args.beta}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}.png'
+            print(count, total_rec_loss.item()/args.print_freq, f'{total_kl_loss.item()/args.print_freq}' if args.vae else '')
+            name = f'\treconstructed_i{count}_size{args.latent_size}_kl{args.beta:.3f}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
             vae.eval()
             with torch.no_grad():
                 reconstructed_image = vae(input_image.cuda())
             plot_image(reconstructed_image, name)
             vae.train()
             total_rec_loss = 0
-            total_b_loss = 0
+            total_kl_loss = 0
         
 
 # %%
