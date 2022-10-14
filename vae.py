@@ -19,6 +19,7 @@ def get_args_parser(add_help=True):
     parser = argparse.ArgumentParser(description="PyTorch Detection Training", add_help=add_help)
 
     parser.add_argument("--data_dir", default="data", type=str, help="path to save outputs")
+    parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
     parser.add_argument("--train_batch_size", default=50, type=int)
     parser.add_argument("--test_batch_size", default=50, type=int)
     parser.add_argument("--latent_size", default=64, type=int)
@@ -74,33 +75,38 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
 
 
 class Encoder(nn.Module):
-    def __init__(self, vae=False, latent_size=None) -> None:
+    def __init__(self, vae=False, latent_size=None, num_channels=None) -> None:
         super().__init__()
         self.vae = vae
         mult = 2 if vae else 1
         self.latent_size = latent_size
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2)
-        self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
-        self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=5, stride=1, padding=2)
+        self.num_channels = 64
+        self.kernel_size = 3
+        if self.kernel_size == 3:
+            padding = 1
+        elif self.kernel_size == 5:
+            padding = 2
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
+        self.conv2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
+        self.conv3 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
-        self.fc = nn.Linear(in_features=8*8*128, out_features=mult*latent_size)
+        self.fc = nn.Linear(in_features=8*8*self.num_channels, out_features=mult*latent_size)
         self.relu = nn.ReLU()
         
-    def forward(self, x):
-        # input x is (bs, 3, 32, 32) for cifar images
+    def forward(self, x):   # input x is (bs, 3, 32, 32) for cifar images
         x = self.conv1(x)
         x = self.relu(x)
         x = self.max_pool(x)
         x = self.conv2(x)
         x = self.relu(x)
         x = self.max_pool(x)
-        # x = self.conv3(x)
-        # x = self.relu(x)
+        x = self.conv3(x)
+        x = self.relu(x)
 
-        x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*256)
+        x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*self.num_channels)
         
-        x = self.fc(x)  # should be (bs, 2*latent_size)
+        x = self.fc(x)  # should be (bs, mult*latent_size)
         
         if self.vae:
             out = x.reshape(x.shape[0], self.latent_size, 2)
@@ -110,37 +116,34 @@ class Encoder(nn.Module):
         return out
     
 class Decoder(nn.Module):
-    def __init__(self, latent_size) -> None:
+    def __init__(self, latent_size, num_channels=None) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=64, kernel_size=5, stride=1, padding=2)  # TODO should we use smaller kernels here?
-        if latent_size == 64:
-            self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
-            self.conv3 = nn.Conv2d(in_channels=128, out_channels=3, kernel_size=5, stride=1, padding=2)
-        elif latent_size == 256:
-            self.conv2 = nn.Conv2d(in_channels=64, out_channels=3, kernel_size=5, stride=1, padding=2)
-        else:
-            raise(NotImplementedError)
+        self.num_channels = 64
+        self.kernel_size = 3
+        if self.kernel_size == 3:
+            padding = 1
+        elif self.kernel_size == 5:
+            padding = 2
+        self.fc = nn.Linear(in_features=latent_size, out_features=self.num_channels*8*8)  # expand latent vector into 64x 8x8 feature maps
+        self.conv1 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)  # TODO should we use smaller kernels here?
+        self.conv2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
+        self.conv3 = nn.Conv2d(in_channels=self.num_channels, out_channels=3, kernel_size=self.kernel_size, stride=1, padding=padding)
+        
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear")  # do we want upsample of deconv layer?
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
-        self.init_size = int(np.sqrt(latent_size))
-        
-    def forward(self, x):
-        # input shape: (bs, 1, 16, 16) assuming latent_size is 256, or 8, 8 if it's 64
-        x = x.reshape(x.shape[0], 1, self.init_size, self.init_size)  # TODO do we want to reshape or view (faster)?
-        #x = self.upsample(x)  # do we want to upsample or convolve first?
+    
+    def forward(self, x):   # x shape: (bs, latent_size) 
+        x = self.fc(x)
+        x = self.relu(x)
+        x = x.reshape(x.shape[0], self.num_channels, 8, 8)  # TODO do we want to reshape or view (faster)?
         x = self.conv1(x)
         x = self.relu(x)
-        x = self.upsample(x) 
+        x = self.upsample(x)  # self.num_channelsx16x16
         x = self.conv2(x)
-        if self.init_size == 16:
-            pass
-        elif self.init_size == 8:
-            x = self.relu(x)
-            x = self.upsample(x) 
-            x = self.conv3(x)
-        else:
-            raise(NotImplementedError)
+        x = self.relu(x)
+        x = self.upsample(x)  # self.num_channelsx32x32
+        x = self.conv3(x)     # 3x32x32
         
         if args.sigmoid:
             out = self.sigmoid(x)
@@ -151,10 +154,10 @@ class Decoder(nn.Module):
         
         
 class VAE(nn.Module):
-    def __init__(self, vae=False, latent_size=None) -> None:
+    def __init__(self, vae=False, latent_size=256, num_channels=64) -> None:
         super().__init__()
-        self.encoder = Encoder(vae=vae, latent_size=latent_size)
-        self.decoder = Decoder(latent_size)
+        self.encoder = Encoder(vae=vae, latent_size=latent_size, num_channels=num_channels)
+        self.decoder = Decoder(latent_size, num_channels=num_channels)
         self.vae = vae
         self.latent_size = latent_size
         
@@ -183,7 +186,18 @@ class VAE(nn.Module):
         out = self.decoder(self.latent_vector)
         
         return out
+    
 
+def plot_image(image, name='image.png'):
+    image = image.squeeze(0).permute(1,2,0)
+    image = image - image.min()
+    image = image / image.max()
+    image = image.cpu().detach()
+
+    plt.imshow(image)
+    plt.show()
+    plt.savefig(name)
+    
 # %%
 parser = get_args_parser()
 #args = get_args_parser().parse_args()
@@ -203,28 +217,22 @@ vae = VAE(vae=args.vae, latent_size=args.latent_size).cuda()
 reconstructed_image = vae(input_image.cuda())
 
 # %%
-
-def plot_image(image, name='image.png'):
-    image = image.squeeze(0).permute(1,2,0)
-    image = image - image.min()
-    image = image / image.max()
-    image = image.cpu().detach()
-
-    plt.imshow(image)
-    plt.show()
-    plt.savefig(name)
     
 plot_image(input_image, 'original_image.png')
-plot_image(reconstructed_image, 'reconstructed_image.png')
+#plot_image(reconstructed_image, 'reconstructed_image.png')
 
 # %%
 
 # train see https://github.com/orybkin/sigma-vae-pytorch
 
 # create optimizer
-optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=0.000)
+optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=args.wd)
 
-reconstruction_loss = nn.MSELoss()
+if args.loss == 'mse':
+    reconstruction_loss = nn.MSELoss()
+elif args.loss == 'bce':
+    reconstruction_loss = nn.BCELoss()
+    
 if args.vae:
     norm_loss = nn.KLDivLoss()
 
@@ -243,9 +251,8 @@ for epoch in range(args.epochs):
     for image, label in train_dataloader:
         image = image.cuda()
         reconstructed = vae(image)
-        if count == 5000:
-            breakpoint()
-        rec_loss = reconstruction_loss(image, reconstructed)
+
+        rec_loss = reconstruction_loss(reconstructed, image)
         total_rec_loss += rec_loss
         loss = rec_loss
         
@@ -263,13 +270,19 @@ for epoch in range(args.epochs):
             # to combat vanishing KL loss:
             if args.vae:
                 args.beta *= 1.5
+                beta_str = f'{args.beta:.3f}'
             else:
-                args.beta = '_no_vae'
-            print(count, total_rec_loss.item()/args.print_freq, f'{total_kl_loss.item()/args.print_freq}' if args.vae else '')
-            name = f'\treconstructed_i{count}_size{args.latent_size}_kl{args.beta:.3f}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
+                beta_str = '_no_vae'
+
             vae.eval()
             with torch.no_grad():
                 reconstructed_image = vae(input_image.cuda())
+
+            test_loss = reconstruction_loss(input_image.cuda(), reconstructed_image).item()
+            kl_loss_str = f"kl {(total_kl_loss.item()/args.print_freq):.4f}" if args.vae else ""
+            print(f'\t{count} losses: train {(total_rec_loss.item()/args.print_freq):.4f} test {test_loss:.4f} {kl_loss_str}')
+            name = f'reconstructed_i{count}_size{args.latent_size}_kl{beta_str}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
+            
             plot_image(reconstructed_image, name)
             vae.train()
             total_rec_loss = 0
