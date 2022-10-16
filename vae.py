@@ -23,6 +23,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--train_batch_size", default=50, type=int)
     parser.add_argument("--test_batch_size", default=50, type=int)
     parser.add_argument("--latent_size", default=64, type=int)
+    parser.add_argument("--num_channels", default=64, type=int)
     parser.add_argument("--print_freq", default=1000, type=int)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
@@ -80,7 +81,7 @@ class Encoder(nn.Module):
         self.vae = vae
         mult = 2 if vae else 1
         self.latent_size = latent_size
-        self.num_channels = 64
+        self.num_channels = num_channels
         self.kernel_size = 3
         if self.kernel_size == 3:
             padding = 1
@@ -105,7 +106,6 @@ class Encoder(nn.Module):
         x = self.relu(x)
 
         x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*self.num_channels)
-        
         x = self.fc(x)  # should be (bs, mult*latent_size)
         
         if self.vae:
@@ -118,7 +118,7 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_size, num_channels=None) -> None:
         super().__init__()
-        self.num_channels = 64
+        self.num_channels = num_channels
         self.kernel_size = 3
         if self.kernel_size == 3:
             padding = 1
@@ -198,6 +198,22 @@ def plot_image(image, name='image.png'):
     plt.show()
     plt.savefig(name)
     
+def plot_grid(model, input_images=None, name=''):
+    model.eval()
+    with torch.no_grad():
+        reconstructed_images = model(input_images.cuda())
+    
+    stack = torch.stack([input_images, reconstructed_images.cpu()], dim=1).flatten(0, 1)
+    grid = torchvision.utils.make_grid(stack, nrow=input_images.shape[0]).permute(1, 2, 0)
+    plt.figure(figsize=(7,4.5))  # assuming 4 images
+    plt.imshow(grid)
+    plt.axis('off')
+    plt.savefig(f'grid_{name}.png')
+    #plt.clf()
+    plt.close()
+    
+    
+    
 # %%
 parser = get_args_parser()
 #args = get_args_parser().parse_args()
@@ -210,23 +226,24 @@ train_dataloader, test_dataloader = get_data(
     test_batch_size=args.test_batch_size
     )
 
+vae = VAE(vae=args.vae, latent_size=args.latent_size, num_channels=args.num_channels).cuda()
+
 input_image = iter(test_dataloader).next()[0][0].reshape(1, 3, 32, 32)
-
-vae = VAE(vae=args.vae, latent_size=args.latent_size).cuda()
-
-reconstructed_image = vae(input_image.cuda())
-
-# %%
-    
 plot_image(input_image, 'original_image.png')
-#plot_image(reconstructed_image, 'reconstructed_image.png')
+# reconstructed_image = vae(input_image.cuda())
+# plot_image(reconstructed_image, 'reconstructed_image.png')
+
+train_input_images = next(iter(train_dataloader))[0][:4]
+test_input_images = next(iter(test_dataloader))[0][:4]
 
 # %%
 
 # train see https://github.com/orybkin/sigma-vae-pytorch
 
 # create optimizer
+
 optim = torch.optim.AdamW(vae.parameters(), lr=args.lr, weight_decay=args.wd)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(train_dataloader))
 
 if args.loss == 'mse':
     reconstruction_loss = nn.MSELoss()
@@ -246,7 +263,7 @@ vae.train()
 print('\n\n')
 
 for epoch in range(args.epochs):
-    print(f'Epoch {epoch}')
+    print(f'Epoch {epoch}  LR {lr_scheduler.get_last_lr()[0]:.5f}')
 
     for image, label in train_dataloader:
         image = image.cuda()
@@ -258,18 +275,19 @@ for epoch in range(args.epochs):
         
         if args.vae:
             kl_loss = norm_loss(vae.stats, normal_stats)
+            total_kl_loss += kl_loss.abs()
             loss += args.beta * kl_loss.abs()
-            total_rec_loss += kl_loss
         
         optim.zero_grad()
         loss.backward()
         optim.step()
+        lr_scheduler.step()
         count += 1
         
         if count % args.print_freq == 0:
             # to combat vanishing KL loss:
             if args.vae:
-                args.beta *= 1.5
+                args.beta *= 1.05
                 beta_str = f'{args.beta:.3f}'
             else:
                 beta_str = '_no_vae'
@@ -279,11 +297,13 @@ for epoch in range(args.epochs):
                 reconstructed_image = vae(input_image.cuda())
 
             test_loss = reconstruction_loss(input_image.cuda(), reconstructed_image).item()
-            kl_loss_str = f"kl {(total_kl_loss.item()/args.print_freq):.4f}" if args.vae else ""
+            kl_loss_str = f"kl beta {args.beta} loss {(total_kl_loss.item()/args.print_freq):.4f}" if args.vae else ""
             print(f'\t{count} losses: train {(total_rec_loss.item()/args.print_freq):.4f} test {test_loss:.4f} {kl_loss_str}')
-            name = f'reconstructed_i{count}_size{args.latent_size}_kl{beta_str}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
-            
-            plot_image(reconstructed_image, name)
+            #name = f'reconstructed_i{count}_size{args.latent_size}_kl{beta_str}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
+            #plot_image(reconstructed_image, name)
+            name = f'size{args.latent_size}_kl{beta_str}_bs{args.train_batch_size}_lr{args.lr:.5f}_wd{args.wd:.5f}.png'
+            plot_grid(vae, train_input_images, name='train_'+name)
+            plot_grid(vae, test_input_images, name='test_'+name)
             vae.train()
             total_rec_loss = 0
             total_kl_loss = 0
