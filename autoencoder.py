@@ -26,6 +26,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--test_batch_size", default=50, type=int)
     parser.add_argument("--latent_size", default=64, type=int)
     parser.add_argument("--num_channels", default=64, type=int)
+    parser.add_argument("--kernel_size", default=3, type=int)
     parser.add_argument("--print_freq", default=1000, type=int)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
@@ -37,6 +38,9 @@ def get_args_parser(add_help=True):
     parser.add_argument("--train", dest="train", help="train model", action="store_true")
     parser.add_argument("--variational", dest="variational", help="use simple autoencoder, not variational", action="store_true")
     parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
+    parser.add_argument("--no_pool", dest="no_pool", help="don't use max pooling for downsampling, use stride=2 conv", action="store_true")
+    parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
+    parser.add_argument("--no_upsample", dest="no_upsample", help="don't use nn.Upsample for upsampling, use deconv", action="store_true")
     parser.add_argument("--interpolation", default="bilinear", type=str, help=f"upsample interpolation mode in the decoder, "
                         f"'nearest', 'linear', 'bilinear', 'bicubic' and 'trilinear'")
     
@@ -82,89 +86,123 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
 
 
 class Encoder(nn.Module):
-    def __init__(self, variational=False, latent_size=None, num_channels=None) -> None:
+    def __init__(self, variational=False, latent_size=None, num_channels=None, kernel_size=None, no_pool=False, debug=False) -> None:
         super().__init__()
+        self.debug = debug
         self.variational = variational
         mult = 2 if variational else 1
         self.latent_size = latent_size
+        self.no_pool = no_pool
         self.num_channels = num_channels
-        self.kernel_size = 3
+        self.kernel_size = kernel_size
         if self.kernel_size == 3:
             padding = 1
         elif self.kernel_size == 5:
             padding = 2
+        else:
+            print(f'\n\nkernel_size {self.kernel_size} is not supported\n\n')
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.conv2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.conv3 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
-        self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        if self.no_pool:
+            self.downsample1 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding)
+            self.downsample2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding)
+        else:
+            self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
         self.fc = nn.Linear(in_features=8*8*self.num_channels, out_features=mult*latent_size)
-        self.relu = nn.ReLU()
+        self.act = nn.ReLU()
         
     def forward(self, x):   # input x is (bs, 3, 32, 32) for cifar images
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.max_pool(x)
-        x = self.conv2(x)
-        x = self.relu(x)
-        x = self.max_pool(x)
-        x = self.conv3(x)
-        x = self.relu(x)
-
+        print_debug(x, self.debug, name='Encoder: input')
+        x = self.act(self.conv1(x))
+        print_debug(x, self.debug, name='Encoder: after conv1')
+        x = self.act(self.downsample1(x)) if self.no_pool else self.max_pool(x)
+        print_debug(x, self.debug, name='Encoder: after downsample/max_pool')
+        x = self.act(self.conv2(x))
+        print_debug(x, self.debug, name='Encoder: after conv2')
+        x = self.act(self.downsample2(x)) if self.no_pool else self.max_pool(x)
+        print_debug(x, self.debug, name='Encoder: after downsample/max_pool')
+        x = self.act(self.conv3(x))
+        print_debug(x, self.debug, name='Encoder: after conv3')
         x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*self.num_channels)
         x = self.fc(x)  # should be (bs, mult*latent_size)
+        print_debug(x, self.debug, name='Encoder: after fc')
         
         if self.variational:
             out = x.reshape(x.shape[0], self.latent_size, 2)
         else:
             out = x
-        
+        print_debug(x, self.debug, name='Encoder: after reshape')
         return out
     
 class Decoder(nn.Module):
-    def __init__(self, latent_size, num_channels=None, sigmoid=None, interpolation='bilinear') -> None:
+    def __init__(self, latent_size, num_channels=None, kernel_size=None, sigmoid=None, interpolation='bilinear', no_upsample=False, debug=False) -> None:
         super().__init__()
+        self.debug = debug
         self.num_channels = num_channels
         self.use_sigmoid = sigmoid
-        self.kernel_size = 3
+        self.no_upsample = no_upsample
+        self.kernel_size = kernel_size
         if self.kernel_size == 3:
             padding = 1
         elif self.kernel_size == 5:
             padding = 2
+        else:
+            print(f'\n\nkernel_size {self.kernel_size} is not supported\n\n')
         self.fc = nn.Linear(in_features=latent_size, out_features=self.num_channels*8*8)  # expand latent vector into 64x 8x8 feature maps
         self.conv1 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)  # TODO should we use smaller kernels here?
         self.conv2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.conv3 = nn.Conv2d(in_channels=self.num_channels, out_channels=3, kernel_size=self.kernel_size, stride=1, padding=padding)
-        
-        self.upsample = nn.Upsample(scale_factor=2, mode=interpolation)  # do we want upsample of deconv layer?
-        self.relu = nn.ReLU()
+        if self.no_upsample:
+            self.deconv1 = nn.ConvTranspose2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding, output_padding=1)
+            self.deconv2 = nn.ConvTranspose2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding, output_padding=1)
+        else:
+            self.upsample = nn.Upsample(scale_factor=2, mode=interpolation)  # do we want upsample of deconv layer?
+        self.act = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
     
     def forward(self, x):   # x shape: (bs, latent_size) 
-        x = self.fc(x)
-        x = self.relu(x)
+        print_debug(x, self.debug, name='Decoder: input')
+        x = self.act(self.fc(x))
         x = x.reshape(x.shape[0], self.num_channels, 8, 8)  # TODO do we want to reshape or view (faster)?
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = self.upsample(x)  # self.num_channelsx16x16
-        x = self.conv2(x)
-        x = self.relu(x)
-        x = self.upsample(x)  # self.num_channelsx32x32
+        print_debug(x, self.debug, name='Decoder: after fc')
+        x = self.act(self.conv1(x))
+        print_debug(x, self.debug, name='Decoder: after conv1')
+        x = self.act(self.deconv1(x)) if self.no_upsample else self.upsample(x) # self.num_channelsx16x16
+        print_debug(x, self.debug, name='Decoder: after deconv1/upsample')
+        x = self.act(self.conv2(x))
+        print_debug(x, self.debug, name='Decoder: after conv2')
+        x = self.act(self.deconv2(x)) if self.no_upsample else self.upsample(x)  # self.num_channelsx32x32
+        print_debug(x, self.debug, name='Decoder: after deconv1/upsample')
         x = self.conv3(x)     # 3x32x32
+        print_debug(x, self.debug, name='Decoder: after conv3')
         
         if self.use_sigmoid:
             out = self.sigmoid(x)
         else:
             out = x
+        print_debug(x, self.debug, name='Decoder: after sigmoid')
         
         return out
         
         
 class Autoencoder(nn.Module):
-    def __init__(self, variational=False, latent_size=256, num_channels=64, sigmoid=True, interpolation='bilinear') -> None:
+    def __init__(
+        self, 
+        variational=False, 
+        latent_size=256, 
+        num_channels=64,
+        kernel_size=3,
+        sigmoid=True, 
+        interpolation='bilinear',
+        no_pool=False,
+        no_upsample=False,
+        debug=False,
+        ) -> None:
         super().__init__()
-        self.encoder = Encoder(variational=variational, latent_size=latent_size, num_channels=num_channels)
-        self.decoder = Decoder(latent_size, num_channels=num_channels, sigmoid=sigmoid, interpolation=interpolation)
+        self.encoder = Encoder(variational=variational, latent_size=latent_size, num_channels=num_channels, kernel_size=kernel_size, no_pool=no_pool, debug=debug)
+        self.decoder = Decoder(latent_size, num_channels=num_channels, kernel_size=kernel_size, sigmoid=sigmoid, interpolation=interpolation, no_upsample=no_upsample, debug=debug)
         self.variational = variational
         self.latent_size = latent_size
         
@@ -230,6 +268,10 @@ def plot_grid(model, input_images=None, name=''):
     #plt.clf()
     plt.close()
     
+def print_debug(x, debug=False, name=''):
+    if debug:
+        print(f'{name} shape: {list(x.shape)}\n\tvalues: {x.flatten()[:8]}')
+    
     
     
 # %%
@@ -261,8 +303,12 @@ model = Autoencoder(
     variational=args.variational, 
     latent_size=args.latent_size, 
     num_channels=args.num_channels,
+    kernel_size=args.kernel_size,
     sigmoid=args.sigmoid, 
-    interpolation=args.interpolation
+    interpolation=args.interpolation,
+    no_pool=args.no_pool,
+    no_upsample=args.no_upsample,
+    debug=args.debug,
     ).cuda()
 
 input_image = iter(test_dataloader).next()[0][0].reshape(1, 3, 32, 32)
@@ -297,7 +343,7 @@ num_batches = len(train_dataloader)
 if args.variational:
     beta_str = f'vae_{args.beta}x{args.beta_mult}'
 else:
-    beta_str = '_plain_ae'
+    beta_str = 'plain-ae'
     
 if args.checkpoint is not None:
     model.load_state_dict(checkpoint['state_dict'])
@@ -306,7 +352,7 @@ if args.checkpoint is not None:
     init_epoch = checkpoint['epoch']
     beta = checkpoint['current_beta']
     
-experiment_str = args.tag + f'size{args.latent_size}_kl{beta_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
+experiment_str = args.tag + f'size{args.latent_size}_{beta_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
 print(f'\n\n{experiment_str}\n\n')
 
 train_input_images = next(iter(train_dataloader))[0][:4]
@@ -315,9 +361,9 @@ test_input_images = next(iter(test_dataloader))[0][:4]
 if args.evaluate:
     print(f'\n\nEvaluating model')
     model.eval()
-    plot_grid(model, train_input_images, name='train_' + experiment_str)
-    plot_grid(model, test_input_images, name='test_' + experiment_str)
-    print(f'\n\nPlots saved to plots/train-test_{experiment_str}.png\n\n')
+    plot_grid(model, train_input_images, name=experiment_str+'_train')
+    plot_grid(model, test_input_images, name=experiment_str+'_test')
+    print(f'\n\nPlots saved to plots/{experiment_str}_train-test.png\n\n')
     
 if args.sample:
     print(f'\n\nSampling 8 images from a random latent vector')
@@ -357,9 +403,12 @@ if args.train:
             reconstructed_image = model(input_image.cuda())
 
         test_loss = reconstruction_loss(input_image.cuda(), reconstructed_image).item()
-        kl_loss_str = f"kl_loss {(total_kl_loss.item()/num_batches):.4f}" if args.variational else ""
+        kl_loss_str = f"kl {(total_kl_loss.item()/num_batches):.4f}" if args.variational else ""
         loss_str = f'losses: train {(total_rec_loss.item()/num_batches):.4f} test {test_loss:.4f} {kl_loss_str}'
-        changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + f' beta {beta:.3f}' if args.variational else ''
+        changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.3f}' if args.variational else '')
+        # changes_str1 = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' 
+        # changes_str2 = f' beta {beta:.3f}' if args.variational else ''
+        # changes_str = changes_str1 + changes_str2
         print(f'Epoch {epoch}  {loss_str} {changes_str}')
         #name = f'reconstructed_e{epoch}_{experiment_str}.png'
         #plot_image(reconstructed_image, name)
