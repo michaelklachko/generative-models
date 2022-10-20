@@ -1,4 +1,5 @@
 # %% 
+from genericpath import isfile
 import numpy as np
 import os
 import argparse
@@ -21,9 +22,10 @@ def get_args_parser(add_help=True):
     parser.add_argument("--data_dir", default="data", type=str, help="path to dataset")
     parser.add_argument("--checkpoint", default=None, type=str, help="path to model checkpoint")
     parser.add_argument("--tag", default="", type=str, help="string to prepend when saving checkpoints")
+    parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
     parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
     parser.add_argument("--train_batch_size", default=50, type=int)
-    parser.add_argument("--test_batch_size", default=50, type=int)
+    parser.add_argument("--test_batch_size", default=100, type=int)
     parser.add_argument("--latent_size", default=64, type=int)
     parser.add_argument("--num_channels", default=64, type=int)
     parser.add_argument("--kernel_size", default=3, type=int)
@@ -39,7 +41,6 @@ def get_args_parser(add_help=True):
     parser.add_argument("--variational", dest="variational", help="use simple autoencoder, not variational", action="store_true")
     parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
     parser.add_argument("--no_pool", dest="no_pool", help="don't use max pooling for downsampling, use stride=2 conv", action="store_true")
-    parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
     parser.add_argument("--no_upsample", dest="no_upsample", help="don't use nn.Upsample for upsampling, use deconv", action="store_true")
     parser.add_argument("--interpolation", default="bilinear", type=str, help=f"upsample interpolation mode in the decoder, "
                         f"'nearest', 'linear', 'bilinear', 'bicubic' and 'trilinear'")
@@ -114,7 +115,7 @@ class Encoder(nn.Module):
         self.act = nn.ReLU()
         
     def forward(self, x):   # input x is (bs, 3, 32, 32) for cifar images
-        print_debug(x, self.debug, name='Encoder: input')
+        print_debug(x, self.debug, name='\nEncoder: input')
         x = self.act(self.conv1(x))
         print_debug(x, self.debug, name='Encoder: after conv1')
         x = self.act(self.downsample1(x)) if self.no_pool else self.max_pool(x)
@@ -206,7 +207,6 @@ class Autoencoder(nn.Module):
         self.variational = variational
         self.latent_size = latent_size
         
-    
     def forward(self, x):
         # encode an image into two stats vectors (means and stds)
         # sample a latent vector from the stats vectors
@@ -222,7 +222,7 @@ class Autoencoder(nn.Module):
             stds = self.stats[:, :, 1]
         
             # reparametrization trick: sample a value as mean + std * N(0, 1)
-            self.normal = torch.randn((x.shape[0], self.latent_size), device='cuda')
+            self.normal = torch.randn((x.shape[0], self.latent_size), device=device)
             assert self.normal.shape == means.shape == stds.shape
             self.latent_vector = means + stds * self.normal
         else:
@@ -232,17 +232,18 @@ class Autoencoder(nn.Module):
         
         return out
  
-def sample(model, name=None):
-    model.eval()
-    latent_vector = torch.randn(size=(8, model.latent_size), device='cuda')
-    out = model.decoder(latent_vector.cuda())
-    grid = torchvision.utils.make_grid(out.cpu(), nrow=4).permute(1, 2, 0)
-    plt.figure(figsize=(7,4.5))  # assuming 2x4 images
-    plt.imshow(grid)
-    plt.axis('off')
-    plt.savefig(f'plots/samples_{name}.png')
-    #plt.clf()
-    plt.close()
+    def sample(self, name=None):
+        self.eval()
+        latent_vector = torch.randn(size=(8, model.latent_size), device=device)
+        out = self.decoder(latent_vector.to(device))
+        grid = torchvision.utils.make_grid(out.cpu(), nrow=4).permute(1, 2, 0)
+        plt.figure(figsize=(7,4.5))  # assuming 2x4 images
+        plt.imshow(grid)
+        plt.axis('off')
+        plt.savefig(f'plots/samples_{name}.png')
+        #plt.clf()
+        plt.close()
+        
       
 def plot_image(image, name='image.png'):
     image = image.squeeze(0).permute(1,2,0)
@@ -257,7 +258,7 @@ def plot_image(image, name='image.png'):
 def plot_grid(model, input_images=None, name=''):
     model.eval()
     with torch.no_grad():
-        reconstructed_images = model(input_images.cuda())
+        reconstructed_images = model(input_images.to(device))
     
     stack = torch.stack([input_images, reconstructed_images.cpu()], dim=1).flatten(0, 1)
     grid = torchvision.utils.make_grid(stack, nrow=input_images.shape[0]).permute(1, 2, 0)
@@ -273,12 +274,12 @@ def print_debug(x, debug=False, name=''):
         print(f'{name} shape: {list(x.shape)}\n\tvalues: {x.flatten()[:8]}')
     
     
-    
-# %%
 parser = get_args_parser()
 #args = get_args_parser().parse_args()
+# need this because of inline vscode cell execution
 args, unknown = parser.parse_known_args()
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 train_dataloader, test_dataloader = get_data(
     data_dir=args.data_dir, 
@@ -309,14 +310,8 @@ model = Autoencoder(
     no_pool=args.no_pool,
     no_upsample=args.no_upsample,
     debug=args.debug,
-    ).cuda()
+    ).to(device)
 
-input_image = iter(test_dataloader).next()[0][0].reshape(1, 3, 32, 32)
-plot_image(input_image, 'original_image.png')
-# reconstructed_image = model(input_image.cuda())
-# plot_image(reconstructed_image, 'reconstructed_image.png')
-
-# %%
 
 # train see https://github.com/orybkin/sigma-vae-pytorch
 
@@ -330,20 +325,20 @@ elif args.loss == 'bce':
     
 if args.variational:
     norm_loss = nn.KLDivLoss()
+    normal_stats_train = torch.zeros((args.train_batch_size, args.latent_size, 2), device=device)
+    normal_stats_train[:, :, 1] = 1
+    normal_stats_test = torch.zeros((args.test_batch_size, args.latent_size, 2), device=device)
+    normal_stats_test[:, :, 1] = 1
 
-    normal_stats = torch.zeros((args.train_batch_size, args.latent_size, 2), device='cuda')
-    normal_stats[:, :, 1] = 1
-
-total_rec_loss = 0
-total_kl_loss = 0
 beta = args.beta
 init_epoch = 0
-num_batches = len(train_dataloader)
+num_train_batches = len(train_dataloader)
+num_test_batches = len(test_dataloader)
 
 if args.variational:
-    beta_str = f'vae_{args.beta}x{args.beta_mult}'
+    model_type = f'vae_{args.beta}x{args.beta_mult}'
 else:
-    beta_str = 'plain-ae'
+    model_type = 'plain-ae'
     
 if args.checkpoint is not None:
     model.load_state_dict(checkpoint['state_dict'])
@@ -352,45 +347,55 @@ if args.checkpoint is not None:
     init_epoch = checkpoint['epoch']
     beta = checkpoint['current_beta']
     
-experiment_str = args.tag + f'size{args.latent_size}_{beta_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
+pool_str = 'pool-stride' if args.no_pool else 'pool-max'
+upsample_str = 'upsample-deconv' if args.no_upsample else f'upsample-{args.interpolation}'
+    
+experiment_str = args.tag + f'{model_type}_latent{args.latent_size}_chan{args.num_channels}_{pool_str}_{upsample_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
 print(f'\n\n{experiment_str}\n\n')
 
-train_input_images = next(iter(train_dataloader))[0][:4]
-test_input_images = next(iter(test_dataloader))[0][:4]
+# load images from disk for plotting (otherwise train images are randomly picked every time)
+if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examples.pth'):
+    train_input_images = torch.load('data/train_examples.pth')
+    test_input_images = torch.load('data/test_examples.pth')
+else:
+    train_input_images = next(iter(train_dataloader))[0][:4]
+    test_input_images = next(iter(test_dataloader))[0][:4]
+    torch.save(train_input_images, 'data/train_examples.pth')
+    torch.save(test_input_images, 'data/test_examples.pth')
 
 if args.evaluate:
     print(f'\n\nEvaluating model')
-    model.eval()
     plot_grid(model, train_input_images, name=experiment_str+'_train')
     plot_grid(model, test_input_images, name=experiment_str+'_test')
     print(f'\n\nPlots saved to plots/{experiment_str}_train-test.png\n\n')
     
 if args.sample:
     print(f'\n\nSampling 8 images from a random latent vector')
-    sample(model, name=experiment_str)
+    model.sample(name=experiment_str)
     print(f'\n\nPlot saved to plots/samples_{experiment_str}.png\n\n')
     
 if args.train:
     for epoch in range(init_epoch, args.epochs, 1):
         model.train()
-        total_rec_loss = 0
-        total_kl_loss = 0
+        total_train_rec_loss = 0
+        total_train_kl_loss = 0
+        total_train_loss = 0
         
         for image, label in train_dataloader:
-            image = image.cuda()
+            image = image.to(device)
             reconstructed = model(image)
 
-            rec_loss = reconstruction_loss(reconstructed, image)
-            total_rec_loss += rec_loss
-            loss = rec_loss
+            train_rec_loss = reconstruction_loss(reconstructed, image)
+            total_train_rec_loss += train_rec_loss
+            train_loss = train_rec_loss
             
             if args.variational:
-                kl_loss = norm_loss(model.stats, normal_stats)
-                total_kl_loss += kl_loss.abs()
-                loss += beta * kl_loss.abs()
+                train_kl_loss = norm_loss(model.stats, normal_stats_train)
+                total_train_kl_loss += train_kl_loss.abs()
+                train_loss += beta * train_kl_loss.abs()
             
             optim.zero_grad()
-            loss.backward()
+            train_loss.backward()
             optim.step()
             lr_scheduler.step()
             
@@ -398,23 +403,32 @@ if args.train:
         if args.variational:
             beta *= args.beta_mult
 
+        # compute test loss (on test dataset)
         model.eval()
         with torch.no_grad():
-            reconstructed_image = model(input_image.cuda())
+            total_test_rec_loss = 0
+            total_test_kl_loss = 0
+            total_test_loss = 0
+            for test_image, label in test_dataloader:
+                test_image = test_image.to(device)
+                test_reconstructed = model(test_image)
 
-        test_loss = reconstruction_loss(input_image.cuda(), reconstructed_image).item()
-        kl_loss_str = f"kl {(total_kl_loss.item()/num_batches):.4f}" if args.variational else ""
-        loss_str = f'losses: train {(total_rec_loss.item()/num_batches):.4f} test {test_loss:.4f} {kl_loss_str}'
+                test_rec_loss = reconstruction_loss(test_reconstructed, test_image)
+                total_test_rec_loss += test_rec_loss
+                
+                if args.variational:
+                    test_kl_loss = norm_loss(model.stats, normal_stats_test)
+                    total_test_kl_loss += test_kl_loss.abs()
+                    
+            total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
+                
+        kl_loss_str = f"kl train {(total_train_kl_loss/num_train_batches):.4f} test {(total_test_kl_loss/num_test_batches):.4f}" if args.variational else ""
+        loss_str = f'losses: train {(total_train_rec_loss/num_train_batches):.4f} test {(total_test_rec_loss/num_test_batches):.4f} {kl_loss_str}'
         changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.3f}' if args.variational else '')
-        # changes_str1 = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' 
-        # changes_str2 = f' beta {beta:.3f}' if args.variational else ''
-        # changes_str = changes_str1 + changes_str2
         print(f'Epoch {epoch}  {loss_str} {changes_str}')
-        #name = f'reconstructed_e{epoch}_{experiment_str}.png'
-        #plot_image(reconstructed_image, name)
         
-        plot_grid(model, train_input_images, name='train_' + experiment_str)
-        plot_grid(model, test_input_images, name='test_' + experiment_str)
+        plot_grid(model, train_input_images, name=experiment_str+'_train')
+        plot_grid(model, test_input_images, name=experiment_str+'_test')
                 
         # checkpointing:
         checkpoint = {}
@@ -424,6 +438,7 @@ if args.train:
         checkpoint['epoch'] = epoch
         checkpoint['args'] = args
         checkpoint['current_beta'] = beta
+        checkpoint['losses'] = loss_str
         
         path = 'checkpoints/' + experiment_str + ".pth"
         torch.save(checkpoint, path)
