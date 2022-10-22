@@ -42,7 +42,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
     parser.add_argument("--no_pool", dest="no_pool", help="don't use max pooling for downsampling, use stride=2 conv", action="store_true")
     parser.add_argument("--no_upsample", dest="no_upsample", help="don't use nn.Upsample for upsampling, use deconv", action="store_true")
-    parser.add_argument("--interpolation", default="bilinear", type=str, help=f"upsample interpolation mode in the decoder, "
+    parser.add_argument("--interpolation", default="nearest", type=str, help=f"upsample interpolation mode in the decoder, "
                         f"'nearest', 'linear', 'bilinear', 'bicubic' and 'trilinear'")
     
     return parser
@@ -261,7 +261,7 @@ def plot_grid(model, input_images=None, name=''):
         reconstructed_images = model(input_images.to(device))
     
     stack = torch.stack([input_images, reconstructed_images.cpu()], dim=1).flatten(0, 1)
-    grid = torchvision.utils.make_grid(stack, nrow=input_images.shape[0]).permute(1, 2, 0)
+    grid = torchvision.utils.make_grid(stack, normalize=True, nrow=input_images.shape[0]).permute(1, 2, 0)
     plt.figure(figsize=(7,4.5))  # assuming 4 images
     plt.imshow(grid)
     plt.axis('off')
@@ -275,9 +275,9 @@ def print_debug(x, debug=False, name=''):
     
     
 parser = get_args_parser()
-#args = get_args_parser().parse_args()
-# need this because of inline vscode cell execution
-args, unknown = parser.parse_known_args()
+args = get_args_parser().parse_args()
+# use below for inline vscode cell execution
+# args, unknown = parser.parse_known_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -315,16 +315,16 @@ model = Autoencoder(
 
 # train see https://github.com/orybkin/sigma-vae-pytorch
 
-optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(train_dataloader))
-
 if args.loss == 'mse':
     reconstruction_loss = nn.MSELoss()
 elif args.loss == 'bce':
     reconstruction_loss = nn.BCELoss()
     
 if args.variational:
-    norm_loss = nn.KLDivLoss()
+    norm_loss = nn.KLDivLoss(reduction='batchmean', log_target=False) 
+    # L(preds, targets) = targets*log(targets/preds) = targets*(log(targets) - log(preds))
+    # batchmean means loss = loss.mean() / batch_size, predictions are expected in 
+    # log space, because targets will be converted to log_space, unless log_target is set to True
     normal_stats_train = torch.zeros((args.train_batch_size, args.latent_size, 2), device=device)
     normal_stats_train[:, :, 1] = 1
     normal_stats_test = torch.zeros((args.test_batch_size, args.latent_size, 2), device=device)
@@ -340,6 +340,9 @@ if args.variational:
 else:
     model_type = 'plain-ae'
     
+optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(train_dataloader))
+
 if args.checkpoint is not None:
     model.load_state_dict(checkpoint['state_dict'])
     optim.load_state_dict(checkpoint['optimizer'])
@@ -390,7 +393,9 @@ if args.train:
             train_loss = train_rec_loss
             
             if args.variational:
-                train_kl_loss = norm_loss(model.stats, normal_stats_train)
+                #breakpoint()
+                train_kl_loss = reconstruction_loss(model.stats, normal_stats_train)
+                #train_kl_loss = norm_loss(model.stats, normal_stats_train)
                 total_train_kl_loss += train_kl_loss.abs()
                 train_loss += beta * train_kl_loss.abs()
             
@@ -417,13 +422,14 @@ if args.train:
                 total_test_rec_loss += test_rec_loss
                 
                 if args.variational:
-                    test_kl_loss = norm_loss(model.stats, normal_stats_test)
+                    test_kl_loss = reconstruction_loss(model.stats, normal_stats_test)
+                    #test_kl_loss = norm_loss(model.stats, normal_stats_test)
                     total_test_kl_loss += test_kl_loss.abs()
                     
             total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
                 
-        kl_loss_str = f"kl train {(total_train_kl_loss/num_train_batches):.4f} test {(total_test_kl_loss/num_test_batches):.4f}" if args.variational else ""
-        loss_str = f'losses: train {(total_train_rec_loss/num_train_batches):.4f} test {(total_test_rec_loss/num_test_batches):.4f} {kl_loss_str}'
+        kl_loss_str = f"kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
+        loss_str = f'losses: train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f} {kl_loss_str}'
         changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.3f}' if args.variational else '')
         print(f'Epoch {epoch}  {loss_str} {changes_str}')
         
