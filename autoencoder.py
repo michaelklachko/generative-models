@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 
@@ -206,6 +207,7 @@ class Autoencoder(nn.Module):
         self.decoder = Decoder(latent_size, num_channels=num_channels, kernel_size=kernel_size, sigmoid=sigmoid, interpolation=interpolation, no_upsample=no_upsample, debug=debug)
         self.variational = variational
         self.latent_size = latent_size
+        self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
         # encode an image into two stats vectors (means and stds)
@@ -219,12 +221,13 @@ class Autoencoder(nn.Module):
         if self.variational:
             self.stats = out
             means = self.stats[:, :, 0]
-            stds = self.stats[:, :, 1]
+            log_vars = self.stats[:, :, 1]   # stds have to be positive
+            stds = torch.exp(0.5 * log_vars)
         
             # reparametrization trick: sample a value as mean + std * N(0, 1)
             self.normal = torch.randn((x.shape[0], self.latent_size), device=device)
             assert self.normal.shape == means.shape == stds.shape
-            self.latent_vector = means + stds * self.normal
+            self.latent_vector = means + stds * self.normal   # (num_images, 256)
         else:
             self.latent_vector = out
         
@@ -235,7 +238,7 @@ class Autoencoder(nn.Module):
     def sample(self, name=None):
         self.eval()
         latent_vector = torch.randn(size=(8, model.latent_size), device=device)
-        out = self.decoder(latent_vector.to(device))
+        out = self.decoder(latent_vector)
         grid = torchvision.utils.make_grid(out.cpu(), nrow=4).permute(1, 2, 0)
         plt.figure(figsize=(7,4.5))  # assuming 2x4 images
         plt.imshow(grid)
@@ -393,12 +396,19 @@ if args.train:
             train_loss = train_rec_loss
             
             if args.variational:
-                #breakpoint()
-                train_kl_loss = reconstruction_loss(model.stats, normal_stats_train)
-                #train_kl_loss = norm_loss(model.stats, normal_stats_train)
-                total_train_kl_loss += train_kl_loss.abs()
-                train_loss += beta * train_kl_loss.abs()
-            
+                mu = model.stats[:, :, 0]
+                log_var = model.stats[:, :, 1]
+                sigma = torch.exp(0.5 * log_var)
+                # for explanation of the formula below, see https://arxiv.org/abs/1906.02691 
+                train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+                
+                # mu_loss = reconstruction_loss(mu, torch.zeros_like(mu))
+                # sigma_loss = reconstruction_loss(sigma, torch.ones_like(sigma))
+                # train_kl_loss = mu_loss + sigma_loss
+
+                total_train_kl_loss += train_kl_loss
+                train_loss += beta * train_kl_loss
+                
             optim.zero_grad()
             train_loss.backward()
             optim.step()
@@ -414,6 +424,8 @@ if args.train:
             total_test_rec_loss = 0
             total_test_kl_loss = 0
             total_test_loss = 0
+            latent_mean = 0
+            latent_std = 0
             for test_image, label in test_dataloader:
                 test_image = test_image.to(device)
                 test_reconstructed = model(test_image)
@@ -422,16 +434,26 @@ if args.train:
                 total_test_rec_loss += test_rec_loss
                 
                 if args.variational:
-                    test_kl_loss = reconstruction_loss(model.stats, normal_stats_test)
-                    #test_kl_loss = norm_loss(model.stats, normal_stats_test)
-                    total_test_kl_loss += test_kl_loss.abs()
+                    mu = model.stats[:, :, 0]
+                    log_var = model.stats[:, :, 1]
+                    sigma = torch.exp(0.5 * log_var)
+                    test_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+
+                    # mu_loss = reconstruction_loss(mu, torch.zeros_like(mu))
+                    # sigma_loss = reconstruction_loss(sigma, torch.ones_like(sigma))
+                    # test_kl_loss = mu_loss + sigma_loss
+
+                    total_test_kl_loss += test_kl_loss
+                    latent_mean += mu.abs().mean()
+                    latent_std += sigma.abs().mean()
                     
             total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
-                
+           
+        latent_stats_str = f'mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f}' if args.variational else ''    
         kl_loss_str = f"kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
-        loss_str = f'losses: train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f} {kl_loss_str}'
-        changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.3f}' if args.variational else '')
-        print(f'Epoch {epoch}  {loss_str} {changes_str}')
+        loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}  {kl_loss_str}'
+        changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
+        print(f'Epoch {epoch}  {loss_str}  {latent_stats_str}  {changes_str}')
         
         plot_grid(model, train_input_images, name=experiment_str+'_train')
         plot_grid(model, test_input_images, name=experiment_str+'_test')
@@ -448,3 +470,5 @@ if args.train:
         
         path = 'checkpoints/' + experiment_str + ".pth"
         torch.save(checkpoint, path)
+        
+        model.sample(name=experiment_str)
