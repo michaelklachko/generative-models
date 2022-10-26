@@ -2,6 +2,7 @@
 from genericpath import isfile
 import numpy as np
 import os
+from datetime import datetime
 import argparse
 import matplotlib
 matplotlib.use('Agg')
@@ -34,6 +35,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--wd", default=0.0, type=float)
+    parser.add_argument("--act", default='gelu', type=str, help='relu, leaky-relu, elu, selu, gelu, swish, mish')
     parser.add_argument("--beta", default=0.01, type=float)
     parser.add_argument("--beta_mult", default=1.05, type=float)
     parser.add_argument("--sample", dest="sample", help="generate an image from a random latent vector", action="store_true")
@@ -41,6 +43,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--train", dest="train", help="train model", action="store_true")
     parser.add_argument("--variational", dest="variational", help="use simple autoencoder, not variational", action="store_true")
     parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
+    parser.add_argument("--mse", dest="mse", help="ise MSE loss instead of KL loss", action="store_true")
     parser.add_argument("--no_pool", dest="no_pool", help="don't use max pooling for downsampling, use stride=2 conv", action="store_true")
     parser.add_argument("--no_upsample", dest="no_upsample", help="don't use nn.Upsample for upsampling, use deconv", action="store_true")
     parser.add_argument("--interpolation", default="nearest", type=str, help=f"upsample interpolation mode in the decoder, "
@@ -88,7 +91,7 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
 
 
 class Encoder(nn.Module):
-    def __init__(self, variational=False, latent_size=None, num_channels=None, kernel_size=None, no_pool=False, debug=False) -> None:
+    def __init__(self, variational=False, latent_size=None, num_channels=None, kernel_size=None, act=None, no_pool=False, debug=False) -> None:
         super().__init__()
         self.debug = debug
         self.variational = variational
@@ -113,7 +116,7 @@ class Encoder(nn.Module):
             self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
         # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
         self.fc = nn.Linear(in_features=8*8*self.num_channels, out_features=mult*latent_size)
-        self.act = nn.ReLU()
+        self.act = act
         
     def forward(self, x):   # input x is (bs, 3, 32, 32) for cifar images
         print_debug(x, self.debug, name='\nEncoder: input')
@@ -139,7 +142,7 @@ class Encoder(nn.Module):
         return out
     
 class Decoder(nn.Module):
-    def __init__(self, latent_size, num_channels=None, kernel_size=None, sigmoid=None, interpolation='bilinear', no_upsample=False, debug=False) -> None:
+    def __init__(self, latent_size, num_channels=None, kernel_size=None, act=None, sigmoid=None, interpolation='bilinear', no_upsample=False, debug=False) -> None:
         super().__init__()
         self.debug = debug
         self.num_channels = num_channels
@@ -161,7 +164,7 @@ class Decoder(nn.Module):
             self.deconv2 = nn.ConvTranspose2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding, output_padding=1)
         else:
             self.upsample = nn.Upsample(scale_factor=2, mode=interpolation)  # do we want upsample of deconv layer?
-        self.act = nn.ReLU()
+        self.act = act
         self.sigmoid = nn.Sigmoid()
     
     def forward(self, x):   # x shape: (bs, latent_size) 
@@ -196,6 +199,7 @@ class Autoencoder(nn.Module):
         latent_size=256, 
         num_channels=64,
         kernel_size=3,
+        act=nn.ReLU,
         sigmoid=True, 
         interpolation='bilinear',
         no_pool=False,
@@ -203,8 +207,8 @@ class Autoencoder(nn.Module):
         debug=False,
         ) -> None:
         super().__init__()
-        self.encoder = Encoder(variational=variational, latent_size=latent_size, num_channels=num_channels, kernel_size=kernel_size, no_pool=no_pool, debug=debug)
-        self.decoder = Decoder(latent_size, num_channels=num_channels, kernel_size=kernel_size, sigmoid=sigmoid, interpolation=interpolation, no_upsample=no_upsample, debug=debug)
+        self.encoder = Encoder(variational=variational, latent_size=latent_size, num_channels=num_channels, kernel_size=kernel_size, act=act, no_pool=no_pool, debug=debug)
+        self.decoder = Decoder(latent_size, num_channels=num_channels, kernel_size=kernel_size, act=act, sigmoid=sigmoid, interpolation=interpolation, no_upsample=no_upsample, debug=debug)
         self.variational = variational
         self.latent_size = latent_size
         self.sigmoid = nn.Sigmoid()
@@ -235,10 +239,12 @@ class Autoencoder(nn.Module):
         
         return out
  
-    def sample(self, name=None):
+    def sample(self, name=None, num_images=8, return_samples=False):
         self.eval()
-        latent_vector = torch.randn(size=(8, model.latent_size), device=device)
+        latent_vector = torch.randn(size=(num_images, model.latent_size), device=device)
         out = self.decoder(latent_vector)
+        if return_samples:
+            return out
         grid = torchvision.utils.make_grid(out.cpu(), nrow=4).permute(1, 2, 0)
         plt.figure(figsize=(7,4.5))  # assuming 2x4 images
         plt.imshow(grid)
@@ -247,6 +253,104 @@ class Autoencoder(nn.Module):
         #plt.clf()
         plt.close()
         
+
+def compute_fid(model, images1, images2):
+    from scipy.linalg import sqrtm
+    # compute feature vectors for real and generated images, using model
+    # compute feature-wise statistics (means and covariances) for the feature vectors
+    # compute distance between statistics, using FID formula
+    model.eval()
+    with torch.no_grad():
+        # need to pass input through the entire model (encoder, sampler, decoder) to get features (latent_vector)
+        _ = model(images1)
+        features1 = model.latent_vector.cpu().numpy()  # (bs, num_features)
+        _ = model(images2)
+        features2 = model.latent_vector.cpu().numpy()
+    
+    means1 = features1.mean(0)    # (bs, num_features) --> (num_features)
+    means2 = features2.mean(0)
+    
+    # calculate mean and covariance statistics
+    sigma1 = np.cov(features1, rowvar=False)
+    sigma2 = np.cov(features2, rowvar=False)
+    # calculate sum squared difference between means
+    ssdiff = np.sum((means1 - means2)**2.0)
+    # calculate sqrt of product between cov
+    covmean = sqrtm(sigma1.dot(sigma2))
+    # check and correct imaginary numbers from sqrt
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return fid
+
+def compute_fid2(model, images1, images2, eps=1e-6):
+    # https://github.com/mseitzer/pytorch-fid/blob/master/src/pytorch_fid/fid_score.py
+    """Numpy implementation of the Frechet Distance.
+    The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
+    and X_2 ~ N(mu_2, C_2) is
+            d^2 = ||mu_1 - mu_2||^2 + Tr(C_1 + C_2 - 2*sqrt(C_1*C_2)).
+    Stable version by Dougal J. Sutherland.
+    Params:
+    -- mu1   : Numpy array containing the activations of a layer of the
+               inception net (like returned by the function 'get_predictions')
+               for generated samples.
+    -- mu2   : The sample mean over activations, precalculated on an
+               representative data set.
+    -- sigma1: The covariance matrix over activations for generated samples.
+    -- sigma2: The covariance matrix over activations, precalculated on an
+               representative data set.
+    Returns:
+    --   : The Frechet Distance.
+    """
+    
+    from scipy.linalg import sqrtm
+    # compute feature vectors for real and generated images, using model
+    # compute feature-wise statistics (means and covariances) for the feature vectors
+    # compute distance between statistics, using FID formula
+    model.eval()
+    with torch.no_grad():
+        # need to pass input through the entire model (encoder, sampler, decoder) to get features (latent_vector)
+        _ = model(images1)
+        features1 = model.latent_vector.cpu().numpy()  # (bs, num_features)
+        _ = model(images2)
+        features2 = model.latent_vector.cpu().numpy()
+    
+    mu1 = features1.mean(0)    # (bs, num_features) --> (num_features)
+    mu2 = features2.mean(0)
+    
+    sigma1 = np.cov(features1, rowvar=False)
+    sigma2 = np.cov(features2, rowvar=False)
+
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+
+    assert mu1.shape == mu2.shape, 'Training and test mean vectors have different lengths'
+    assert sigma1.shape == sigma2.shape, 'Training and test covariances have different dimensions'
+
+    diff = mu1 - mu2
+
+    # Product might be almost singular
+    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        print(f'fid calculation produces singular product, adding {eps} to diagonal of cov estimates')
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = sqrtm((sigma1 + offset).dot(sigma2 + offset))
+
+    # Numerical error might give slight imaginary component
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError(f'Imaginary component {m}')
+        covmean = covmean.real
+
+    tr_covmean = np.trace(covmean)
+
+    return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+    
       
 def plot_image(image, name='image.png'):
     image = image.squeeze(0).permute(1,2,0)
@@ -290,6 +394,23 @@ train_dataloader, test_dataloader = get_data(
     test_batch_size=args.test_batch_size
     )
 
+if args.act == 'relu':
+    act = nn.ReLU()
+elif args.act == 'leaky-relu':
+    act = nn.LeakyReLU()
+elif args.act == 'elu':   # did not converge on cifar
+    act = nn.ELU()
+elif args.act == 'selu':  # did not converge on cifar
+    act = nn.SELU()
+elif args.act == 'gelu':
+    act = nn.GELU()
+elif args.act == 'swish':
+    act = nn.SiLU()
+elif args.act == 'mish':  # did not converge on cifar
+    act = nn.Mish()
+else:
+    raise(NotImplementedError)
+
 if args.checkpoint is not None:
     print(f'\n\nLoading model checkpoint from {args.checkpoint}')
     checkpoint = torch.load(args.checkpoint)
@@ -308,6 +429,7 @@ model = Autoencoder(
     latent_size=args.latent_size, 
     num_channels=args.num_channels,
     kernel_size=args.kernel_size,
+    act=act,
     sigmoid=args.sigmoid, 
     interpolation=args.interpolation,
     no_pool=args.no_pool,
@@ -400,11 +522,12 @@ if args.train:
                 log_var = model.stats[:, :, 1]
                 sigma = torch.exp(0.5 * log_var)
                 # for explanation of the formula below, see https://arxiv.org/abs/1906.02691 
-                train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-                
-                # mu_loss = reconstruction_loss(mu, torch.zeros_like(mu))
-                # sigma_loss = reconstruction_loss(sigma, torch.ones_like(sigma))
-                # train_kl_loss = mu_loss + sigma_loss
+                if args.mse:
+                    mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
+                    sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
+                    train_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
+                else:
+                    train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
                 total_train_kl_loss += train_kl_loss
                 train_loss += beta * train_kl_loss
@@ -437,11 +560,12 @@ if args.train:
                     mu = model.stats[:, :, 0]
                     log_var = model.stats[:, :, 1]
                     sigma = torch.exp(0.5 * log_var)
-                    test_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
-                    # mu_loss = reconstruction_loss(mu, torch.zeros_like(mu))
-                    # sigma_loss = reconstruction_loss(sigma, torch.ones_like(sigma))
-                    # test_kl_loss = mu_loss + sigma_loss
+                    if args.mse:
+                        mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
+                        sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
+                        test_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
+                    else:
+                        test_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
                     total_test_kl_loss += test_kl_loss
                     latent_mean += mu.abs().mean()
@@ -449,11 +573,18 @@ if args.train:
                     
             total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
            
+        if args.variational:
+            samples = model.sample(num_images=args.test_batch_size, return_samples=True)
+            #fid1 = compute_fid(model, test_image, samples)
+            fid2 = compute_fid2(model, test_image, samples)
+            #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
+            
         latent_stats_str = f'mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f}' if args.variational else ''    
         kl_loss_str = f"kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
         loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}  {kl_loss_str}'
         changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
-        print(f'Epoch {epoch}  {loss_str}  {latent_stats_str}  {changes_str}')
+        time_str = f'{str(datetime.now())[:-7]}'
+        print(f'{time_str}  Epoch {epoch:>3d}  {loss_str}  {latent_stats_str}  fid {fid2:.1f}  {changes_str}')
         
         plot_grid(model, train_input_images, name=experiment_str+'_train')
         plot_grid(model, test_input_images, name=experiment_str+'_test')
@@ -462,7 +593,7 @@ if args.train:
         checkpoint = {}
         checkpoint['state_dict'] = model.state_dict()
         checkpoint['optimizer'] = optim.state_dict()
-        checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
+        checkpoint['lr_scheduler'] = lr_scheduler.state_dict() 
         checkpoint['epoch'] = epoch
         checkpoint['args'] = args
         checkpoint['current_beta'] = beta
@@ -472,3 +603,12 @@ if args.train:
         torch.save(checkpoint, path)
         
         model.sample(name=experiment_str)
+
+
+# TODO:
+# 1. FID scores - number of images (orig/generated batches) should be greater than latent size  - DONE
+# 2. Different act functions - DONE
+# 3. Tensorboard support
+# 4. Plots of loss, FID, mean, var
+# 5. save logs of train output
+# 6. add CelebA dataset
