@@ -1,6 +1,7 @@
 # %% 
 from genericpath import isfile
 import numpy as np
+from scipy.linalg import sqrtm
 import os
 from datetime import datetime
 import argparse
@@ -23,11 +24,12 @@ def get_args_parser(add_help=True):
 
     parser.add_argument("--data_dir", default="data", type=str, help="path to dataset")
     parser.add_argument("--checkpoint", default=None, type=str, help="path to model checkpoint")
+    parser.add_argument("--fid_model_checkpoint", default='checkpoints/plain-ae_latent256_chan64_pool-stride_upsample-deconv_bs50_lr0.001_wd0.01_e100_full_model.pth', type=str, help="path to model checkpoint")
     parser.add_argument("--tag", default="", type=str, help="string to prepend when saving checkpoints")
     parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
     parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
     parser.add_argument("--train_batch_size", default=50, type=int)
-    parser.add_argument("--test_batch_size", default=100, type=int)
+    parser.add_argument("--test_batch_size", default=500, type=int)
     parser.add_argument("--latent_size", default=64, type=int)
     parser.add_argument("--num_channels", default=64, type=int)
     parser.add_argument("--kernel_size", default=3, type=int)
@@ -284,8 +286,13 @@ def compute_fid(model, images1, images2):
     fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
     return fid
 
-def compute_fid2(model, images1, images2, eps=1e-6):
+def compute_fid2(model=None, images1=None, images2=None, eps=1e-6):
+    # images1 are reference images from test dataset ('cifar', 'celeba', etc) OR a batch of images in torch format
+    # images2 are samples from the model we want to evaluate
+    # model can be an actual model object, or a string pointing to a saved model checkpoint - must be full model checkpoint, not a dict
+    
     # https://github.com/mseitzer/pytorch-fid/blob/master/src/pytorch_fid/fid_score.py
+    
     """Numpy implementation of the Frechet Distance.
     The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
     and X_2 ~ N(mu_2, C_2) is
@@ -303,8 +310,14 @@ def compute_fid2(model, images1, images2, eps=1e-6):
     Returns:
     --   : The Frechet Distance.
     """
+    images1 = images1.to(images2.device)
     
-    from scipy.linalg import sqrtm
+    if isinstance(model, str):
+        model = torch.load(model)
+        if isinstance(model, dict):
+            raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
+        model = model.to(images2.device)
+    
     # compute feature vectors for real and generated images, using model
     # compute feature-wise statistics (means and covariances) for the feature vectors
     # compute distance between statistics, using FID formula
@@ -365,7 +378,7 @@ def plot_image(image, name='image.png'):
 def plot_grid(model, input_images=None, name=''):
     model.eval()
     with torch.no_grad():
-        reconstructed_images = model(input_images.to(device))
+        reconstructed_images = model(input_images.to(next(model.parameters()).device))
     
     stack = torch.stack([input_images, reconstructed_images.cpu()], dim=1).flatten(0, 1)
     grid = torchvision.utils.make_grid(stack, normalize=True, nrow=input_images.shape[0]).permute(1, 2, 0)
@@ -437,7 +450,6 @@ model = Autoencoder(
     debug=args.debug,
     ).to(device)
 
-
 # train see https://github.com/orybkin/sigma-vae-pytorch
 
 if args.loss == 'mse':
@@ -486,15 +498,21 @@ if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examp
     train_input_images = torch.load('data/train_examples.pth')
     test_input_images = torch.load('data/test_examples.pth')
 else:
-    train_input_images = next(iter(train_dataloader))[0][:4]
-    test_input_images = next(iter(test_dataloader))[0][:4]
+    train_input_images = next(iter(train_dataloader))[0]
+    test_input_images = next(iter(test_dataloader))[0]
     torch.save(train_input_images, 'data/train_examples.pth')
     torch.save(test_input_images, 'data/test_examples.pth')
-
+    
+if test_input_images.shape[0] < model.latent_size:  # number of images should be >= number of features (to compute FID)
+    print(f'\n\nNumber of test images {test_input_images.shape[0]} should be >= number of '
+          f'features {model.latent_size} in order to compute FID properly (only applies to VAE)\n\n')
+    if args.variational:
+        raise(SystemExit)
+    
 if args.evaluate:
     print(f'\n\nEvaluating model')
-    plot_grid(model, train_input_images, name=experiment_str+'_train')
-    plot_grid(model, test_input_images, name=experiment_str+'_test')
+    plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
+    plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
     print(f'\n\nPlots saved to plots/{experiment_str}_train-test.png\n\n')
     
 if args.sample:
@@ -575,19 +593,23 @@ if args.train:
            
         if args.variational:
             samples = model.sample(num_images=args.test_batch_size, return_samples=True)
-            #fid1 = compute_fid(model, test_image, samples)
-            fid2 = compute_fid2(model, test_image, samples)
+            #fid1 = compute_fid(model, test_input_images, samples)
+            fid2 = compute_fid2(model=args.fid_model_checkpoint, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
+            fid3 = compute_fid2(model=model, images1=test_input_images, images2=samples)
             #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
+            fid_str = f'  fid {fid2:.1f} {fid3:.1f}'
+        else:
+            fid_str = '' 
             
-        latent_stats_str = f'mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f}' if args.variational else ''    
-        kl_loss_str = f"kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
-        loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}  {kl_loss_str}'
-        changes_str = f'LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
+        latent_stats_str = f'  mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f} ' if args.variational else ''    
+        kl_loss_str = f"  kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
+        loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}{kl_loss_str}'
+        changes_str = f'  LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
         time_str = f'{str(datetime.now())[:-7]}'
-        print(f'{time_str}  Epoch {epoch:>3d}  {loss_str}  {latent_stats_str}  fid {fid2:.1f}  {changes_str}')
+        print(f'{time_str}  Epoch {epoch:>3d}  {loss_str}{latent_stats_str}{fid_str}{changes_str}')
         
-        plot_grid(model, train_input_images, name=experiment_str+'_train')
-        plot_grid(model, test_input_images, name=experiment_str+'_test')
+        plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
+        plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
                 
         # checkpointing:
         checkpoint = {}
@@ -603,6 +625,8 @@ if args.train:
         torch.save(checkpoint, path)
         
         model.sample(name=experiment_str)
+    
+    # torch.save(model, 'checkpoints/' + experiment_str + "_full_model.pth")
 
 
 # TODO:
