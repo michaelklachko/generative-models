@@ -1,5 +1,7 @@
 # %% 
+from copy import deepcopy
 from genericpath import isfile
+from turtle import forward
 import numpy as np
 from scipy.linalg import sqrtm
 import os
@@ -37,6 +39,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--wd", default=0.0, type=float)
+    parser.add_argument("--dropout", default=0.2, type=float)
     parser.add_argument("--act", default='gelu', type=str, help='relu, leaky-relu, elu, selu, gelu, swish, mish')
     parser.add_argument("--beta", default=0.01, type=float)
     parser.add_argument("--beta_mult", default=1.05, type=float)
@@ -91,6 +94,65 @@ def get_data(dataset='CIFAR10', data_dir=None, num_samples=None, train_batch_siz
         
     return train_loader, test_loader
 
+
+class Classifier(nn.Module):
+    def __init__(self, args=None) -> None:
+        super().__init__()
+        self.debug = args.debug
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
+        self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1)
+        self.max_pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(in_features=256*4*4, out_features=256)
+        self.fc_out = nn.Linear(in_features=256, out_features=10)
+        self.fc1 = nn.Linear(in_features=128*8*8, out_features=512)
+        self.fc2 = nn.Linear(in_features=512, out_features=10)
+        self.bn1 = nn.BatchNorm2d(num_features=64)
+        self.bn2 = nn.BatchNorm2d(num_features=128)
+        self.bn3 = nn.BatchNorm2d(num_features=256)
+        self.bn4 = nn.BatchNorm1d(num_features=256)
+        self.bn5 = nn.BatchNorm1d(num_features=512)
+        self.dropout = nn.Dropout(p=args.dropout, inplace=False)
+        self.act = nn.GELU()
+        
+    def forward(self, x):
+        print_debug(x, self.debug, name='\nClassifier: input')
+        x = self.act(self.bn1(self.conv1(x)))
+        print_debug(x, self.debug, name='Classifier: after conv1')
+        x = self.max_pool(x)
+        print_debug(x, self.debug, name='Classifier: after maxpool')
+        x = self.act(self.bn2(self.conv2(x)))
+        print_debug(x, self.debug, name='Classifier: after conv2')
+        x = self.max_pool(x)
+        print_debug(x, self.debug, name='Classifier: after maxpool')
+        
+        x = self.act(self.bn3(self.conv3(x)))
+        print_debug(x, self.debug, name='Classifier: after conv3')
+        x = self.max_pool(x)
+        print_debug(x, self.debug, name='Classifier: after maxpool')
+        x = x.reshape(-1, 4*4*256)
+        print_debug(x, self.debug, name='Classifier: after reshape')
+        x = self.act(self.bn4(self.fc(x)))
+        print_debug(x, self.debug, name='Classifier: after fc')
+        x = self.dropout(x)
+        if not self.train:
+            self.features = x
+        x = self.fc_out(x)
+        print_debug(x, self.debug, name='Classifier: after fc_out')
+
+        # x = x.reshape(-1, 8*8*128)
+        # print_debug(x, self.debug, name='Classifier: after reshape')
+        # x = self.act(self.bn5(self.fc1(x)))
+        # print_debug(x, self.debug, name='Classifier: after fc1')
+        # x = self.dropout(x)
+        # if not self.train:
+        #     self.features = x
+        # x = self.fc2(x)
+        # print_debug(x, self.debug, name='Classifier: after fc2')
+        
+        return x
+        
+    
 
 class Encoder(nn.Module):
     def __init__(self, variational=False, latent_size=None, num_channels=None, kernel_size=None, act=None, no_pool=False, debug=False) -> None:
@@ -311,12 +373,7 @@ def compute_fid2(model=None, images1=None, images2=None, eps=1e-6):
     --   : The Frechet Distance.
     """
     images1 = images1.to(images2.device)
-    
-    if isinstance(model, str):
-        model = torch.load(model)
-        if isinstance(model, dict):
-            raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
-        model = model.to(images2.device)
+    model = model.to(images2.device)
     
     # compute feature vectors for real and generated images, using model
     # compute feature-wise statistics (means and covariances) for the feature vectors
@@ -392,7 +449,14 @@ def plot_grid(model, input_images=None, name=''):
 def print_debug(x, debug=False, name=''):
     if debug:
         print(f'{name} shape: {list(x.shape)}\n\tvalues: {x.flatten()[:8]}')
-    
+
+
+def compute_accuracy(outputs, labels):  # TODO get rid of .data
+    with torch.no_grad():
+        batch_size = labels.size(0)
+        pred = outputs.data.max(1)[1]
+        acc = pred.eq(labels.data).sum().item() * 100.0 / batch_size
+        return acc
     
 parser = get_args_parser()
 args = get_args_parser().parse_args()
@@ -406,6 +470,46 @@ train_dataloader, test_dataloader = get_data(
     train_batch_size=args.train_batch_size, 
     test_batch_size=args.test_batch_size
     )
+
+
+print(f'\n\nTraining CIFAR-10 Classifier\n\n')
+model = Classifier(args=args).to(device)
+
+optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+loss_fn = nn.CrossEntropyLoss()
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optim, T_max=args.epochs * len(train_dataloader))
+
+model.train()
+for epoch in range(args.epochs):
+    model.train()
+    tr_accs = []
+    for images, labels in train_dataloader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        loss = loss_fn(outputs, labels)
+        
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        lr_scheduler.step()
+        
+        tr_acc = compute_accuracy(outputs, labels)
+        tr_accs.append(tr_acc)
+    
+    te_accs = []
+    model.eval()
+    with torch.no_grad():
+        for images, labels in test_dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            te_acc = compute_accuracy(outputs, labels)
+            te_accs.append(te_acc)
+           
+    print(f'Epoch {epoch}  train {np.mean(tr_accs):.2f}  test {np.mean(te_accs):.2f}  LR {lr_scheduler.get_last_lr()[0]:.4f}')
+    
+torch.save(model, 'checkpoints/'+args.tag+'cifar_classifier.pth')
+
+raise SystemExit
 
 if args.act == 'relu':
     act = nn.ReLU()
@@ -456,16 +560,6 @@ if args.loss == 'mse':
     reconstruction_loss = nn.MSELoss()
 elif args.loss == 'bce':
     reconstruction_loss = nn.BCELoss()
-    
-if args.variational:
-    norm_loss = nn.KLDivLoss(reduction='batchmean', log_target=False) 
-    # L(preds, targets) = targets*log(targets/preds) = targets*(log(targets) - log(preds))
-    # batchmean means loss = loss.mean() / batch_size, predictions are expected in 
-    # log space, because targets will be converted to log_space, unless log_target is set to True
-    normal_stats_train = torch.zeros((args.train_batch_size, args.latent_size, 2), device=device)
-    normal_stats_train[:, :, 1] = 1
-    normal_stats_test = torch.zeros((args.test_batch_size, args.latent_size, 2), device=device)
-    normal_stats_test[:, :, 1] = 1
 
 beta = args.beta
 init_epoch = 0
@@ -474,6 +568,9 @@ num_test_batches = len(test_dataloader)
 
 if args.variational:
     model_type = f'vae_{args.beta}x{args.beta_mult}'
+    fid_model = torch.load(args.fid_model_checkpoint)
+    if isinstance(model, dict):
+        raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
 else:
     model_type = 'plain-ae'
     
@@ -594,19 +691,19 @@ if args.train:
         if args.variational:
             samples = model.sample(num_images=args.test_batch_size, return_samples=True)
             #fid1 = compute_fid(model, test_input_images, samples)
-            fid2 = compute_fid2(model=args.fid_model_checkpoint, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
+            fid2 = compute_fid2(model=fid_model, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
             fid3 = compute_fid2(model=model, images1=test_input_images, images2=samples)
             #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
             fid_str = f'  fid {fid2:.1f} {fid3:.1f}'
         else:
             fid_str = '' 
             
-        latent_stats_str = f'  mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f} ' if args.variational else ''    
-        kl_loss_str = f"  kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}" if args.variational else ""
+        latent_stats_str = f'  mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f}' if args.variational else ''    
+        kl_loss_str = f'  kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}' if args.variational else ""
         loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}{kl_loss_str}'
         changes_str = f'  LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
         time_str = f'{str(datetime.now())[:-7]}'
-        print(f'{time_str}  Epoch {epoch:>3d}  {loss_str}{latent_stats_str}{fid_str}{changes_str}')
+        print(f'{time_str}  Epoch {epoch:>3d}   {loss_str}{latent_stats_str}{fid_str}{changes_str}')
         
         plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
         plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
