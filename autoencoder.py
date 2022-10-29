@@ -32,14 +32,14 @@ def get_args_parser(add_help=True):
     parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
     parser.add_argument("--train_batch_size", default=50, type=int)
     parser.add_argument("--test_batch_size", default=500, type=int)
-    parser.add_argument("--latent_size", default=64, type=int)
+    parser.add_argument("--latent_size", default=256, type=int)
     parser.add_argument("--num_channels", default=64, type=int)
     parser.add_argument("--kernel_size", default=3, type=int)
     parser.add_argument("--print_freq", default=1000, type=int)
-    parser.add_argument("--epochs", default=10, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--wd", default=0.0, type=float)
-    parser.add_argument("--dropout", default=0.2, type=float)
+    parser.add_argument("--dropout", default=0, type=float)
     parser.add_argument("--act", default='gelu', type=str, help='relu, leaky-relu, elu, selu, gelu, swish, mish')
     parser.add_argument("--beta", default=0.01, type=float)
     parser.add_argument("--beta_mult", default=1.05, type=float)
@@ -99,21 +99,22 @@ class Classifier(nn.Module):
     def __init__(self, args=None) -> None:
         super().__init__()
         self.debug = args.debug
+        self.latent_size = args.latent_size
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=5, stride=1, padding=2)
         self.conv2 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=5, stride=1, padding=2)
         self.conv3 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1)
         self.max_pool = nn.MaxPool2d(2, 2)
-        self.fc = nn.Linear(in_features=256*4*4, out_features=256)
-        self.fc_out = nn.Linear(in_features=256, out_features=10)
-        self.fc1 = nn.Linear(in_features=128*8*8, out_features=512)
-        self.fc2 = nn.Linear(in_features=512, out_features=10)
+        self.fc = nn.Linear(in_features=256*4*4, out_features=self.latent_size)
+        self.fc_out = nn.Linear(in_features=self.latent_size, out_features=10)
+        # self.fc1 = nn.Linear(in_features=128*8*8, out_features=512)
+        # self.fc2 = nn.Linear(in_features=512, out_features=10)
         self.bn1 = nn.BatchNorm2d(num_features=64)
         self.bn2 = nn.BatchNorm2d(num_features=128)
         self.bn3 = nn.BatchNorm2d(num_features=256)
-        self.bn4 = nn.BatchNorm1d(num_features=256)
-        self.bn5 = nn.BatchNorm1d(num_features=512)
+        self.bn4 = nn.BatchNorm1d(num_features=self.latent_size)
+        # self.bn5 = nn.BatchNorm1d(num_features=512)
         self.dropout = nn.Dropout(p=args.dropout, inplace=False)
-        self.act = nn.GELU()
+        self.act = args.act_fn
         
     def forward(self, x):
         print_debug(x, self.debug, name='\nClassifier: input')
@@ -130,17 +131,16 @@ class Classifier(nn.Module):
         print_debug(x, self.debug, name='Classifier: after conv3')
         x = self.max_pool(x)
         print_debug(x, self.debug, name='Classifier: after maxpool')
-        x = x.reshape(-1, 4*4*256)
+        x = x.view(-1, 4*4*256)
         print_debug(x, self.debug, name='Classifier: after reshape')
         x = self.act(self.bn4(self.fc(x)))
         print_debug(x, self.debug, name='Classifier: after fc')
         x = self.dropout(x)
-        if not self.train:
-            self.features = x
+        self.latent_vector = x
         x = self.fc_out(x)
         print_debug(x, self.debug, name='Classifier: after fc_out')
 
-        # x = x.reshape(-1, 8*8*128)
+        # x = x.view(-1, 8*8*128)
         # print_debug(x, self.debug, name='Classifier: after reshape')
         # x = self.act(self.bn5(self.fc1(x)))
         # print_debug(x, self.debug, name='Classifier: after fc1')
@@ -178,7 +178,6 @@ class Encoder(nn.Module):
             self.downsample2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=2, padding=padding)
         else:
             self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        # self.max_pool = nn.MaxPool2d(kernel_size=2, stride=2)  TODO do we need a duplicate max_pool layer?
         self.fc = nn.Linear(in_features=8*8*self.num_channels, out_features=mult*latent_size)
         self.act = act
         
@@ -194,12 +193,12 @@ class Encoder(nn.Module):
         print_debug(x, self.debug, name='Encoder: after downsample/max_pool')
         x = self.act(self.conv3(x))
         print_debug(x, self.debug, name='Encoder: after conv3')
-        x = x.reshape(x.shape[0], -1)  # should be (bs, 8*8*self.num_channels)
+        x = x.view(x.shape[0], -1)  # should be (bs, 8*8*self.num_channels)
         x = self.fc(x)  # should be (bs, mult*latent_size)
         print_debug(x, self.debug, name='Encoder: after fc')
         
         if self.variational:
-            out = x.reshape(x.shape[0], self.latent_size, 2)
+            out = x.view(x.shape[0], self.latent_size, 2)
         else:
             out = x
         print_debug(x, self.debug, name='Encoder: after reshape')
@@ -220,7 +219,7 @@ class Decoder(nn.Module):
         else:
             print(f'\n\nkernel_size {self.kernel_size} is not supported\n\n')
         self.fc = nn.Linear(in_features=latent_size, out_features=self.num_channels*8*8)  # expand latent vector into 64x 8x8 feature maps
-        self.conv1 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)  # TODO should we use smaller kernels here?
+        self.conv1 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.conv2 = nn.Conv2d(in_channels=self.num_channels, out_channels=self.num_channels, kernel_size=self.kernel_size, stride=1, padding=padding)
         self.conv3 = nn.Conv2d(in_channels=self.num_channels, out_channels=3, kernel_size=self.kernel_size, stride=1, padding=padding)
         if self.no_upsample:
@@ -234,7 +233,7 @@ class Decoder(nn.Module):
     def forward(self, x):   # x shape: (bs, latent_size) 
         print_debug(x, self.debug, name='Decoder: input')
         x = self.act(self.fc(x))
-        x = x.reshape(x.shape[0], self.num_channels, 8, 8)  # TODO do we want to reshape or view (faster)?
+        x = x.view(x.shape[0], self.num_channels, 8, 8)
         print_debug(x, self.debug, name='Decoder: after fc')
         x = self.act(self.conv1(x))
         print_debug(x, self.debug, name='Decoder: after conv1')
@@ -451,13 +450,66 @@ def print_debug(x, debug=False, name=''):
         print(f'{name} shape: {list(x.shape)}\n\tvalues: {x.flatten()[:8]}')
 
 
-def compute_accuracy(outputs, labels):  # TODO get rid of .data
+def compute_accuracy(outputs, labels):
     with torch.no_grad():
         batch_size = labels.size(0)
-        pred = outputs.data.max(1)[1]
-        acc = pred.eq(labels.data).sum().item() * 100.0 / batch_size
+        pred = outputs.max(1)[1]
+        acc = pred.eq(labels).sum().item() * 100.0 / batch_size
         return acc
     
+def train_classifier(args):
+    # python autoencoder.py --lr 0.001 --wd 0.1 --epochs 100 --dropout 0 --act relu
+    print(f'\n\nTraining CIFAR-10 Classifier\n\n')
+    
+    classifier = Classifier(args=args).to(device)
+    optim = torch.optim.AdamW(classifier.parameters(), lr=args.lr, weight_decay=args.wd)
+    loss_fn = nn.CrossEntropyLoss()
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optim, T_max=args.epochs * len(train_dataloader))
+
+    classifier.train()
+    for epoch in range(args.epochs):
+        classifier.train()
+        tr_accs = []
+        for images, labels in train_dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = classifier(images)
+            loss = loss_fn(outputs, labels)
+            
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+            lr_scheduler.step()
+            
+            tr_acc = compute_accuracy(outputs, labels)
+            tr_accs.append(tr_acc)
+        
+        te_accs = []
+        classifier.eval()
+        with torch.no_grad():
+            for images, labels in test_dataloader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = classifier(images)
+                te_acc = compute_accuracy(outputs, labels)
+                te_accs.append(te_acc)
+            
+        print(f'Epoch {epoch}  train {np.mean(tr_accs):.2f}  test {np.mean(te_accs):.2f}  LR {lr_scheduler.get_last_lr()[0]:.4f}')
+        
+    torch.save(classifier, f'checkpoints/cifar_classifier_{args.latent_size}.pth')
+    # torch.save(classifier, f'checkpoints/{args.tag}cifar_classifier_{args.latent_size}.pth')
+    return classifier
+
+def evaluate_classifier(classifier):
+    te_accs = []
+    classifier.eval()
+    with torch.no_grad():
+        for images, labels in test_dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = classifier(images)
+            te_acc = compute_accuracy(outputs, labels)
+            te_accs.append(te_acc)
+    return np.mean(te_accs)
+
+
 parser = get_args_parser()
 args = get_args_parser().parse_args()
 # use below for inline vscode cell execution
@@ -471,45 +523,21 @@ train_dataloader, test_dataloader = get_data(
     test_batch_size=args.test_batch_size
     )
 
-
-print(f'\n\nTraining CIFAR-10 Classifier\n\n')
-model = Classifier(args=args).to(device)
-
-optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-loss_fn = nn.CrossEntropyLoss()
-lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optim, T_max=args.epochs * len(train_dataloader))
-
-model.train()
-for epoch in range(args.epochs):
-    model.train()
-    tr_accs = []
-    for images, labels in train_dataloader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        loss = loss_fn(outputs, labels)
-        
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
-        lr_scheduler.step()
-        
-        tr_acc = compute_accuracy(outputs, labels)
-        tr_accs.append(tr_acc)
+# load images from disk for plotting (otherwise train images are randomly picked every time)
+if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examples.pth'):
+    train_input_images = torch.load('data/train_examples.pth')
+    test_input_images = torch.load('data/test_examples.pth')
+else:
+    train_input_images = next(iter(train_dataloader))[0]
+    test_input_images = next(iter(test_dataloader))[0]
+    torch.save(train_input_images, 'data/train_examples.pth')
+    torch.save(test_input_images, 'data/test_examples.pth')
     
-    te_accs = []
-    model.eval()
-    with torch.no_grad():
-        for images, labels in test_dataloader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            te_acc = compute_accuracy(outputs, labels)
-            te_accs.append(te_acc)
-           
-    print(f'Epoch {epoch}  train {np.mean(tr_accs):.2f}  test {np.mean(te_accs):.2f}  LR {lr_scheduler.get_last_lr()[0]:.4f}')
-    
-torch.save(model, 'checkpoints/'+args.tag+'cifar_classifier.pth')
-
-raise SystemExit
+if test_input_images.shape[0] < args.latent_size:  # number of images should be >= number of features (to compute FID)
+    print(f'\n\nNumber of test images {test_input_images.shape[0]} should be >= number of '
+          f'features {args.latent_size} in order to compute FID properly (only applies to VAE)\n\n')
+    if args.variational:
+        raise(SystemExit)
 
 if args.act == 'relu':
     act = nn.ReLU()
@@ -527,6 +555,9 @@ elif args.act == 'mish':  # did not converge on cifar
     act = nn.Mish()
 else:
     raise(NotImplementedError)
+
+args.act_fn = act
+
 
 if args.checkpoint is not None:
     print(f'\n\nLoading model checkpoint from {args.checkpoint}')
@@ -568,8 +599,20 @@ num_test_batches = len(test_dataloader)
 
 if args.variational:
     model_type = f'vae_{args.beta}x{args.beta_mult}'
+    print(f'\n\nLoading pretrained VAE for FID computation from {args.fid_model_checkpoint}')
     fid_model = torch.load(args.fid_model_checkpoint)
-    if isinstance(model, dict):
+    classifier_checkpoint = f'checkpoints/cifar_classifier_{args.latent_size}.pth'
+    print(f'\n\nInstantiating Classifier for FID computation')
+    if os.path.isfile(classifier_checkpoint):
+        print(f'\n\nFound checkpoint at {classifier_checkpoint}, loading...')
+        classifier = torch.load(classifier_checkpoint)
+        test_acc = evaluate_classifier(classifier)
+        print(f'\n\nCIFAR-10 Test Accuracy {test_acc:.2f}')
+    else:
+        print(f'\n\nClassifier checkpoint is not found at {classifier_checkpoint}')
+        classifier = train_classifier(args)
+        
+    if isinstance(fid_model, dict) or isinstance(classifier, dict):
         raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
 else:
     model_type = 'plain-ae'
@@ -589,22 +632,6 @@ upsample_str = 'upsample-deconv' if args.no_upsample else f'upsample-{args.inter
     
 experiment_str = args.tag + f'{model_type}_latent{args.latent_size}_chan{args.num_channels}_{pool_str}_{upsample_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
 print(f'\n\n{experiment_str}\n\n')
-
-# load images from disk for plotting (otherwise train images are randomly picked every time)
-if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examples.pth'):
-    train_input_images = torch.load('data/train_examples.pth')
-    test_input_images = torch.load('data/test_examples.pth')
-else:
-    train_input_images = next(iter(train_dataloader))[0]
-    test_input_images = next(iter(test_dataloader))[0]
-    torch.save(train_input_images, 'data/train_examples.pth')
-    torch.save(test_input_images, 'data/test_examples.pth')
-    
-if test_input_images.shape[0] < model.latent_size:  # number of images should be >= number of features (to compute FID)
-    print(f'\n\nNumber of test images {test_input_images.shape[0]} should be >= number of '
-          f'features {model.latent_size} in order to compute FID properly (only applies to VAE)\n\n')
-    if args.variational:
-        raise(SystemExit)
     
 if args.evaluate:
     print(f'\n\nEvaluating model')
@@ -691,10 +718,12 @@ if args.train:
         if args.variational:
             samples = model.sample(num_images=args.test_batch_size, return_samples=True)
             #fid1 = compute_fid(model, test_input_images, samples)
-            fid2 = compute_fid2(model=fid_model, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
-            fid3 = compute_fid2(model=model, images1=test_input_images, images2=samples)
+            fid_vae = compute_fid2(model=fid_model, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
+            fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
+            
+            fid_classifier = compute_fid2(classifier, images1=test_input_images, images2=samples)
             #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
-            fid_str = f'  fid {fid2:.1f} {fid3:.1f}'
+            fid_str = f'  fid {fid_classifier:.1f} {fid_vae:.1f} {fid_vae_dynamic:.1f}'
         else:
             fid_str = '' 
             
