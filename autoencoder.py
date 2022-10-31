@@ -419,6 +419,96 @@ def compute_fid2(model=None, images1=None, images2=None, eps=1e-6):
     tr_covmean = np.trace(covmean)
 
     return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+
+def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
+    """
+    Inception Score measures:
+    - classifier confidence in detected objects in an image
+    - diversity of detected objects in a batch of images
+    
+    Input is logits before softmax has been applied 
+    
+    0. Apply softmax to logits to produce output vector of class probabilities 
+    
+    Confidence score computation:
+    1. Sort output values
+    2. Compute ratio of the sum of top-N values to the total sum, for N=1 and N=5
+    3. Weight the combination of the two: confidence score CS = a*S(N=1) + (1-a)*S(N=5), for a in [0, 1]
+    
+    Diversity score computation:
+    1. Record highest predicted class ID for each image in the batch --> vector of class IDs
+    2. Count frequency of each class ID  (ideally it should be ~num_images/num_classes)
+    3. Apply confidence score algo to frequencies: diversity score DS = CS(freq_count(class_ids))
+    
+    Alternatively, we could:
+        1. compute deviations from class_freq to num_images/num_classes for each class
+        2. apply confidence score to this vector, or compute MSE/CE between freq vector and vector of num_images/num_classes
+        
+    Alternatively, in both cases (confidence and diversity), we can simply compute the std of the vector of
+    interest (class probabilities or class ID frequencies)
+    """
+    
+    # images shape: (batch_size, latent_size)
+    device = images.device
+    classifier = classifier.to(device)
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(images)
+        predictions = torch.softmax(logits, dim=1)  # predictions shape: (batch_size, num_classes)
+        num_classes = predictions.shape[1]
+        top1_ratio = (predictions.max(1)[0] / predictions.sum(1)).mean()
+        
+        if N > 1:
+            sorted_predictions = torch.sort(predictions, dim=1, descending=True)  # returns two tensors: (sorted values (min to max), their orig indices).
+            top1_ratio_test = (sorted_predictions[0][:, 0]).mean()  # don't need to divide by total_sum because it's 1 (because of softmax)
+            assert torch.allclose(top1_ratio, top1_ratio_test, atol=1e-6)
+            topN_ratio = (sorted_predictions[0][:, :N].sum(1)).mean()
+            confidence_score = alpha * top1_ratio + (1-alpha) * topN_ratio
+        else:
+            confidence_score = top1_ratio
+        
+        # compute std or variance between predictions and means (1/num_classes)
+        
+        # means = torch.ones_like(predictions) / num_classes
+        # mse = ((predictions - means) ** 2).sum(1) / num_classes
+        # mse_ref = torch.nn.MSELoss()(predictions, means)
+        # variance = predictions.var()
+        # # var(unbiased=False) will match the mse, otherwise it will be divided by num_classes-1, not num_classes
+        # vars = torch.var(predictions, dim=1, unbiased=False)  
+
+        predicted_class_ids = torch.argmax(predictions, dim=1)  # should be vector of class ids
+        class_frequencies = [0] * num_classes
+        for class_id in predicted_class_ids:
+            class_frequencies[class_id] += 1
+        
+        labels = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+        
+        print(f'\nGenerated samples are classified as:')
+        for l, f in zip(labels, class_frequencies):
+            print(l, f)
+        print()
+        
+        class_frequencies = torch.tensor(class_frequencies, dtype=torch.float, device=device)
+        top1_ratio = class_frequencies.max() / class_frequencies.sum()
+        
+        if N > 1:
+            sorted_class_frequencies = torch.sort(class_frequencies, descending=True)
+            total_sums = sorted_class_frequencies[0].sum()
+            top1_ratio_test = (sorted_class_frequencies[0][0] / total_sums)
+            assert torch.allclose(top1_ratio, top1_ratio_test, atol=1e-6)
+            topN_ratio = (sorted_class_frequencies[0][:N].sum() / total_sums)
+            diversity_score1 = 1 - (alpha * top1_ratio + (1-alpha) * topN_ratio)
+        else:
+            diversity_score1 = 1 - top1_ratio
+        
+        # construct the batch with worst possible diversity of class IDs:
+        min_diversity_batch = [0] * (num_classes - 1) + [predictions.shape[0]]
+        min_diversity_batch = torch.tensor(min_diversity_batch, dtype=torch.float, device=device)
+        # best diversity batch will have std = 0
+        # compare current batch diversity to the worst diversity and invert (low score should indicate low diversity)
+        diversity_score2 = 1 - class_frequencies.std() / min_diversity_batch.std()
+        
+    return 100*confidence_score, 100*diversity_score1, 100*diversity_score2
     
       
 def plot_image(image, name='image.png'):
@@ -483,16 +573,10 @@ def train_classifier(args):
             tr_acc = compute_accuracy(outputs, labels)
             tr_accs.append(tr_acc)
         
-        te_accs = []
-        classifier.eval()
-        with torch.no_grad():
-            for images, labels in test_dataloader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = classifier(images)
-                te_acc = compute_accuracy(outputs, labels)
-                te_accs.append(te_acc)
+        train_acc = np.mean(tr_accs)
+        test_acc = evaluate_classifier(classifier)
             
-        print(f'Epoch {epoch}  train {np.mean(tr_accs):.2f}  test {np.mean(te_accs):.2f}  LR {lr_scheduler.get_last_lr()[0]:.4f}')
+        print(f'Epoch {epoch}  train {train_acc:.2f}  test {test_acc:.2f}  LR {lr_scheduler.get_last_lr()[0]:.4f}')
         
     torch.save(classifier, f'checkpoints/cifar_classifier_{args.latent_size}.pth')
     # torch.save(classifier, f'checkpoints/{args.tag}cifar_classifier_{args.latent_size}.pth')
@@ -663,12 +747,12 @@ if args.train:
                 mu = model.stats[:, :, 0]
                 log_var = model.stats[:, :, 1]
                 sigma = torch.exp(0.5 * log_var)
-                # for explanation of the formula below, see https://arxiv.org/abs/1906.02691 
                 if args.mse:
                     mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
                     sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
                     train_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
                 else:
+                    # explained in https://arxiv.org/abs/1906.02691 
                     train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
                 total_train_kl_loss += train_kl_loss
@@ -719,11 +803,22 @@ if args.train:
             samples = model.sample(num_images=args.test_batch_size, return_samples=True)
             #fid1 = compute_fid(model, test_input_images, samples)
             fid_vae = compute_fid2(model=fid_model, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
-            fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
+            #fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
             
             fid_classifier = compute_fid2(classifier, images1=test_input_images, images2=samples)
             #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
-            fid_str = f'  fid {fid_classifier:.1f} {fid_vae:.1f} {fid_vae_dynamic:.1f}'
+            inception_score = compute_inception_score(classifier, samples)
+            confidence, diversity1, diversity2 = inception_score
+            
+            fid_vae_ref = compute_fid2(model=fid_model, images1=test_input_images, images2=image)  # use pretrained cifar model to compute features
+            #fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
+            
+            fid_classifier_ref = compute_fid2(classifier, images1=test_input_images, images2=image)
+            #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
+            inception_score_ref = compute_inception_score(classifier, image, debug=True)
+            confidence_ref, diversity1_ref, diversity2_ref = inception_score_ref
+            
+            fid_str = f'  fid {fid_classifier:.1f}/{fid_vae:.1f} (ref {fid_classifier_ref:.1f}/{fid_vae_ref:.1f})  confidence {confidence:.1f} (ref {confidence_ref:.1f}) diversity {diversity1:.1f}/{diversity2:.1f} (ref {diversity1_ref:.1f}/{diversity2_ref:.1f})'
         else:
             fid_str = '' 
             
@@ -757,8 +852,10 @@ if args.train:
 
 # TODO:
 # 1. FID scores - number of images (orig/generated batches) should be greater than latent size  - DONE
+# 2. Inception Score - WIP
 # 2. Different act functions - DONE
 # 3. Tensorboard support
 # 4. Plots of loss, FID, mean, var
 # 5. save logs of train output
 # 6. add CelebA dataset
+# %%
