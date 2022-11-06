@@ -4,7 +4,7 @@ from scipy.linalg import sqrtm
 import torch
 
 
-def compute_fid(model, images1, images2):
+def compute_fid_(model, images1, images2):
     from scipy.linalg import sqrtm
     # compute feature vectors for real and generated images, using model
     # compute feature-wise statistics (means and covariances) for the feature vectors
@@ -34,7 +34,7 @@ def compute_fid(model, images1, images2):
     fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
     return fid
 
-def compute_fid2(model=None, images1=None, images2=None, eps=1e-6):
+def compute_fid(model=None, images1=None, images2=None, eps=1e-6):
     # images1 are reference images from test dataset ('cifar', 'celeba', etc) OR a batch of images in torch format
     # images2 are samples from the model we want to evaluate
     # model can be an actual model object, or a string pointing to a saved model checkpoint - must be full model checkpoint, not a dict
@@ -170,10 +170,11 @@ def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
         
         labels = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
         
-        print(f'\nGenerated samples are classified as:')
-        for l, f in zip(labels, class_frequencies):
-            print(l, f)
-        print()
+        if debug:
+            print(f'\nImages are classified as:')
+            for l, f in zip(labels, class_frequencies):
+                print(l, f)
+            print()
         
         class_frequencies = torch.tensor(class_frequencies, dtype=torch.float, device=device)
         top1_ratio = class_frequencies.max() / class_frequencies.sum()

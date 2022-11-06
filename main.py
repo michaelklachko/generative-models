@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from dataloaders import get_cifar
 from utils import get_activation_function, plot_grid
 from models.classifiers import evaluate_classifier, train_classifier
-from models.autoencoders import Autoencoder, Encoder, Decoder
-from metrics import compute_fid2, compute_inception_score
+from models.autoencoders import Autoencoder
+from metrics import compute_fid, compute_inception_score
 
 # replace all occurences of comma followed by non-white space character with comma+space: ,(?=[^\s])
 
@@ -22,7 +22,8 @@ def get_args_parser(add_help=True):
 
     parser.add_argument("--data_dir", default="data", type=str, help="path to dataset")
     parser.add_argument("--checkpoint", default=None, type=str, help="path to model checkpoint")
-    parser.add_argument("--fid_model_checkpoint", default='checkpoints/plain-ae_latent256_chan64_pool-stride_upsample-deconv_bs50_lr0.001_wd0.01_e100_full_model.pth', type=str, help="path to model checkpoint")
+    parser.add_argument("--ae_checkpoint", default='checkpoints/plain-ae_latent256_chan64_pool-stride_upsample-deconv_bs50_lr0.001_wd0.01_e100_full_model.pth', type=str, help="path to AE checkpoint")
+    parser.add_argument("--classifier_checkpoint", default=None, type=str, help="path to classifier checkpoint")
     parser.add_argument("--tag", default="", type=str, help="string to prepend when saving checkpoints")
     parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
     parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
@@ -126,9 +127,16 @@ num_test_batches = len(test_dataloader)
 
 if args.variational:
     model_type = f'vae_{args.beta}x{args.beta_mult}'
-    print(f'\n\nLoading pretrained VAE for FID computation from {args.fid_model_checkpoint}')
-    fid_model = torch.load(args.fid_model_checkpoint)
-    classifier_checkpoint = f'checkpoints/cifar_classifier_{args.latent_size}.pth'
+    if os.path.isfile(args.ae_checkpoint):
+        print(f'\n\nLoading pretrained VAE for FID computation from {args.ae_checkpoint}')
+        plain_ae = torch.load(args.ae_checkpoint)
+    else:
+        print(f'\n\nTo compute FID score using a plain autoencoder, provide valid path to checkpoint, or train one:')
+        print(f'\n\npython main.py --latent_size 256 --sigmoid --wd 0.01 --epochs 100 --train --no_upsample --no_pool\n\n')
+        raise(SystemExit)
+    
+    if args.classifier_checkpoint is None:
+        classifier_checkpoint = f'checkpoints/cifar_classifier_{args.latent_size}.pth'
     print(f'\n\nInstantiating Classifier for FID computation')
     if os.path.isfile(classifier_checkpoint):
         print(f'\n\nFound checkpoint at {classifier_checkpoint}, loading...')
@@ -139,7 +147,7 @@ if args.variational:
         print(f'\n\nClassifier checkpoint is not found at {classifier_checkpoint}')
         classifier = train_classifier(args, classifier=None, train_dataloader=train_dataloader, test_dataloader=test_dataloader, device=device)
         
-    if isinstance(fid_model, dict) or isinstance(classifier, dict):
+    if isinstance(plain_ae, dict) or isinstance(classifier, dict):
         raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
 else:
     model_type = 'plain-ae'
@@ -158,7 +166,7 @@ pool_str = 'pool-stride' if args.no_pool else 'pool-max'
 upsample_str = 'upsample-deconv' if args.no_upsample else f'upsample-{args.interpolation}'
     
 experiment_str = args.tag + f'{model_type}_latent{args.latent_size}_chan{args.num_channels}_{pool_str}_{upsample_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
-print(f'\n\n{experiment_str}\n\n')
+print(f'\n\n{experiment_str}')
     
 if args.evaluate:
     print(f'\n\nEvaluating model')
@@ -171,20 +179,61 @@ if args.sample:
     model.sample(name=experiment_str)
     print(f'\n\nPlot saved to plots/samples_{experiment_str}.png\n\n')
     
-if args.train:
-    for epoch in range(init_epoch, args.epochs, 1):
-        model.train()
-        total_train_rec_loss = 0
-        total_train_kl_loss = 0
-        total_train_loss = 0
-        
-        for image, label in train_dataloader:
-            image = image.to(device)
-            reconstructed = model(image)
+def train_one_epoch(args, model, beta=None, train_dataloader=None, optim=None, lr_scheduler=None, device=None):
+    model.train()
+    total_train_rec_loss = 0
+    total_train_kl_loss = 0
+    total_train_loss = 0
+    
+    for image, label in train_dataloader:
+        image = image.to(device)
+        reconstructed = model(image)
 
-            train_rec_loss = reconstruction_loss(reconstructed, image)
-            total_train_rec_loss += train_rec_loss
-            train_loss = train_rec_loss
+        train_rec_loss = F.mse_loss(reconstructed, image)
+        total_train_rec_loss += train_rec_loss
+        train_loss = train_rec_loss
+        
+        if args.variational:
+            mu = model.stats[:, :, 0]
+            log_var = model.stats[:, :, 1]
+            sigma = torch.exp(0.5 * log_var)
+            if args.mse:
+                mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
+                sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
+                train_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
+            else:
+                # explained in https://arxiv.org/abs/1906.02691 
+                train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+
+            total_train_kl_loss += train_kl_loss
+            train_loss += beta * train_kl_loss
+            
+        optim.zero_grad()
+        train_loss.backward()
+        optim.step()
+        lr_scheduler.step()
+        
+    # to combat vanishing KL loss:
+    if args.variational:
+        beta *= args.beta_mult
+    
+    return beta, total_train_rec_loss, total_train_kl_loss
+
+
+def compute_test_loss(args, model, beta=None, test_dataloader=None, device=None):
+    # compute test loss (on test dataset)
+    model.eval()
+    with torch.no_grad():
+        total_test_rec_loss = 0
+        total_test_kl_loss = 0
+        latent_mean = 0
+        latent_std = 0
+        for test_image, label in test_dataloader:
+            test_image = test_image.to(device)
+            test_reconstructed = model(test_image)
+
+            test_rec_loss = F.mse_loss(test_reconstructed, test_image)
+            total_test_rec_loss += test_rec_loss
             
             if args.variational:
                 mu = model.stats[:, :, 0]
@@ -193,84 +242,68 @@ if args.train:
                 if args.mse:
                     mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
                     sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
-                    train_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
+                    test_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
                 else:
-                    # explained in https://arxiv.org/abs/1906.02691 
-                    train_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+                    test_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
 
-                total_train_kl_loss += train_kl_loss
-                train_loss += beta * train_kl_loss
+                total_test_kl_loss += test_kl_loss
+                latent_mean += mu.abs().mean()
+                latent_std += sigma.abs().mean()
                 
-            optim.zero_grad()
-            train_loss.backward()
-            optim.step()
-            lr_scheduler.step()
-            
-        # to combat vanishing KL loss:
-        if args.variational:
-            beta *= args.beta_mult
+        total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
+        return latent_mean, latent_std, total_test_rec_loss, total_test_kl_loss
+    
+    
+def compute_metrics(autoencoder=None, classifier=None, real_images=None, samples=None):
+    #fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
+    fid_vae = compute_fid(model=autoencoder, images1=real_images, images2=samples)  # use pretrained cifar model to compute features
+    fid_classifier = compute_fid(model=classifier, images1=real_images, images2=samples)
+    inception_score = compute_inception_score(classifier, samples)
+    confidence, diversity1, diversity2 = inception_score
+    
+    metrics_str = f'  FID (classifier/AE): {fid_classifier:.1f}/{fid_vae:.1f}  confidence {confidence:.1f}  diversity {diversity1:.1f}/{diversity2:.1f}'    
+    return metrics_str
+    
+    
+if args.train:
+    if args.variational:
+        ref_metrics_str = compute_metrics(autoencoder=plain_ae, classifier=classifier, real_images=test_input_images, samples=train_input_images) + '\n\n'
+    else:
+        ref_metrics_str = ''
+    
+    print(f'\n\nTraining {model_type} model on CIFAR-10 images\n\n{ref_metrics_str}')
+    
+    for epoch in range(init_epoch, args.epochs, 1):
+        beta, total_train_rec_loss, total_train_kl_loss = train_one_epoch(
+            args,
+            model, 
+            beta=beta, 
+            train_dataloader=train_dataloader, 
+            optim=optim, 
+            lr_scheduler=lr_scheduler,
+            device=device,
+        )
 
-        # compute test loss (on test dataset)
-        model.eval()
-        with torch.no_grad():
-            total_test_rec_loss = 0
-            total_test_kl_loss = 0
-            total_test_loss = 0
-            latent_mean = 0
-            latent_std = 0
-            for test_image, label in test_dataloader:
-                test_image = test_image.to(device)
-                test_reconstructed = model(test_image)
-
-                test_rec_loss = reconstruction_loss(test_reconstructed, test_image)
-                total_test_rec_loss += test_rec_loss
-                
-                if args.variational:
-                    mu = model.stats[:, :, 0]
-                    log_var = model.stats[:, :, 1]
-                    sigma = torch.exp(0.5 * log_var)
-                    if args.mse:
-                        mu_loss = F.mse_loss(mu, torch.zeros_like(mu), reduction='none')
-                        sigma_loss = F.mse_loss(sigma, torch.ones_like(sigma), reduction='none')
-                        test_kl_loss = mu_loss.sum(1).mean(0) + sigma_loss.sum(1).mean(0)
-                    else:
-                        test_kl_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
-                    total_test_kl_loss += test_kl_loss
-                    latent_mean += mu.abs().mean()
-                    latent_std += sigma.abs().mean()
-                    
-            total_test_loss = total_test_rec_loss + beta * total_test_kl_loss if args.variational else total_test_rec_loss
+        latent_mean, latent_std, total_test_rec_loss, total_test_kl_loss = compute_test_loss(
+            args, 
+            model, 
+            beta=beta, 
+            test_dataloader=test_dataloader, 
+            device=device,
+        )
            
         if args.variational:
             samples = model.sample(num_images=args.test_batch_size, return_samples=True)
-            #fid1 = compute_fid(model, test_input_images, samples)
-            fid_vae = compute_fid2(model=fid_model, images1=test_input_images, images2=samples)  # use pretrained cifar model to compute features
-            #fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
-            
-            fid_classifier = compute_fid2(classifier, images1=test_input_images, images2=samples)
-            #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
-            inception_score = compute_inception_score(classifier, samples)
-            confidence, diversity1, diversity2 = inception_score
-            
-            fid_vae_ref = compute_fid2(model=fid_model, images1=test_input_images, images2=image)  # use pretrained cifar model to compute features
-            #fid_vae_dynamic = compute_fid2(model=model, images1=test_input_images, images2=samples)
-            
-            fid_classifier_ref = compute_fid2(classifier, images1=test_input_images, images2=image)
-            #print(f'\n\tFID computed on {args.test_batch_size} feature vectors ({args.latent_size} features): {fid1:.2f} {fid2:.2f}\n')
-            inception_score_ref = compute_inception_score(classifier, image, debug=True)
-            confidence_ref, diversity1_ref, diversity2_ref = inception_score_ref
-            
-            fid_str = f'  fid {fid_classifier:.1f}/{fid_vae:.1f} (ref {fid_classifier_ref:.1f}/{fid_vae_ref:.1f})  confidence {confidence:.1f} (ref {confidence_ref:.1f}) diversity {diversity1:.1f}/{diversity2:.1f} (ref {diversity1_ref:.1f}/{diversity2_ref:.1f})'
+            metrics_str = compute_metrics(autoencoder=plain_ae, classifier=classifier, real_images=test_input_images, samples=samples)
         else:
-            fid_str = '' 
+            metrics_str = '' 
             
         latent_stats_str = f'  mean {(latent_mean/num_test_batches):.4f} std {(latent_std/num_test_batches):.4f}' if args.variational else ''    
         kl_loss_str = f'  kl train {(1000*beta*total_train_kl_loss/num_train_batches):.2f} test {(1000*beta*total_test_kl_loss/num_test_batches):.2f}' if args.variational else ""
         loss_str = f'losses:  train {(1000*total_train_rec_loss/num_train_batches):.2f} test {(1000*total_test_rec_loss/num_test_batches):.2f}{kl_loss_str}'
         changes_str = f'  LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.4f}' if args.variational else '')
         time_str = f'{str(datetime.now())[:-7]}'
-        print(f'{time_str}  Epoch {epoch:>3d}   {loss_str}{latent_stats_str}{fid_str}{changes_str}')
+        print(f'{time_str}  Epoch {epoch:>3d}   {loss_str}{latent_stats_str}{metrics_str}{changes_str}')
         
         plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
         plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
