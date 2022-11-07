@@ -177,17 +177,19 @@ def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
             print()
         
         class_frequencies = torch.tensor(class_frequencies, dtype=torch.float, device=device)
-        top1_ratio = class_frequencies.max() / class_frequencies.sum()
         
-        if N > 1:
-            sorted_class_frequencies = torch.sort(class_frequencies, descending=True)
-            total_sums = sorted_class_frequencies[0].sum()
-            top1_ratio_test = (sorted_class_frequencies[0][0] / total_sums)
-            assert torch.allclose(top1_ratio, top1_ratio_test, atol=1e-6)
-            topN_ratio = (sorted_class_frequencies[0][:N].sum() / total_sums)
-            diversity_score1 = 1 - (alpha * top1_ratio + (1-alpha) * topN_ratio)
-        else:
-            diversity_score1 = 1 - top1_ratio
+        ## couple of ways to do it:
+        # top1_ratio = class_frequencies.max() / class_frequencies.sum()
+        
+        # if N > 1:
+        #     sorted_class_frequencies = torch.sort(class_frequencies, descending=True)
+        #     total_sums = sorted_class_frequencies[0].sum()
+        #     top1_ratio_test = (sorted_class_frequencies[0][0] / total_sums)
+        #     assert torch.allclose(top1_ratio, top1_ratio_test, atol=1e-6)
+        #     topN_ratio = (sorted_class_frequencies[0][:N].sum() / total_sums)
+        #     diversity_score1 = 1 - (alpha * top1_ratio + (1-alpha) * topN_ratio)
+        # else:
+        #     diversity_score1 = 1 - top1_ratio
         
         # construct the batch with worst possible diversity of class IDs:
         min_diversity_batch = [0] * (num_classes - 1) + [predictions.shape[0]]
@@ -196,4 +198,4 @@ def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
         # compare current batch diversity to the worst diversity and invert (low score should indicate low diversity)
         diversity_score2 = 1 - class_frequencies.std() / min_diversity_batch.std()
         
-    return 100*confidence_score, 100*diversity_score1, 100*diversity_score2
+    return 100*confidence_score, 100*diversity_score2
