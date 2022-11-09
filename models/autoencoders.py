@@ -133,8 +133,25 @@ class Autoencoder(nn.Module):
         debug=False,
         ) -> None:
         super().__init__()
-        self.encoder = Encoder(variational=variational, latent_size=latent_size, num_channels=num_channels, kernel_size=kernel_size, act=act, no_pool=no_pool, debug=debug)
-        self.decoder = Decoder(latent_size, num_channels=num_channels, kernel_size=kernel_size, act=act, sigmoid=sigmoid, interpolation=interpolation, no_upsample=no_upsample, debug=debug)
+        self.encoder = Encoder(
+            variational=variational, 
+            latent_size=latent_size, 
+            num_channels=num_channels, 
+            kernel_size=kernel_size, 
+            act=act, 
+            no_pool=no_pool, 
+            debug=debug,
+            )
+        self.decoder = Decoder(
+            latent_size, 
+            num_channels=num_channels, 
+            kernel_size=kernel_size, 
+            act=act, 
+            sigmoid=sigmoid, 
+            interpolation=interpolation, 
+            no_upsample=no_upsample, 
+            debug=debug,
+            )
         self.variational = variational
         self.latent_size = latent_size
         self.sigmoid = nn.Sigmoid()
@@ -156,7 +173,6 @@ class Autoencoder(nn.Module):
             stds = torch.exp(0.5 * log_vars)
         
             # reparametrization trick: sample a value as mean + std * N(0, 1)
-            #self.normal = torch.randn((x.shape[0], self.latent_size), device=self.device)  TODO test and remove
             self.normal = torch.randn_like(means)
             assert self.normal.shape == means.shape == stds.shape
             self.latent_vector = means + stds * self.normal   # (num_images, 256)
@@ -178,5 +194,5 @@ class Autoencoder(nn.Module):
         plt.imshow(grid)
         plt.axis('off')
         plt.savefig(f'plots/samples_{name}.png')
-        #plt.clf()
+        #plt.clf()  # not enough, need to actually close 
         plt.close()

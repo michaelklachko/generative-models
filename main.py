@@ -2,7 +2,6 @@ from copy import deepcopy
 import numpy as np
 import os
 from datetime import datetime
-import argparse
 
 import torch
 import torch.nn as nn
@@ -14,186 +13,15 @@ from utils import get_activation_function, plot_grid
 from models.classifiers import evaluate_classifier, train_classifier
 from models.autoencoders import Autoencoder
 from metrics import compute_fid, compute_inception_score
+from arguments import get_args_parser
 
 # replace all occurences of comma followed by non-white space character with comma+space: ,(?=[^\s])
 
 
-def get_args_parser(add_help=True):
-    parser = argparse.ArgumentParser(description="PyTorch Detection Training", add_help=add_help)
-
-    parser.add_argument("--data_dir", default="data", type=str, help="path to dataset")
-    parser.add_argument("--checkpoint", default=None, type=str, help="path to model checkpoint")
-    parser.add_argument("--ae_checkpoint", default='checkpoints/plain-ae_latent256_chan64_pool-stride_upsample-deconv_bs50_lr0.001_wd0.01_e100_full_model.pth', type=str, help="path to AE checkpoint")
-    parser.add_argument("--classifier_checkpoint", default=None, type=str, help="path to classifier checkpoint")
-    parser.add_argument("--tag", default="", type=str, help="string to prepend when saving checkpoints")
-    parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
-    parser.add_argument("--log_tb", dest="log_tb", help="send selected values to tensorboard for plotting", action="store_true")
-    parser.add_argument("--tb_dir", default="logs", type=str, help="path to tensorboard files")
-    parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
-    parser.add_argument("--train_batch_size", default=50, type=int)
-    parser.add_argument("--test_batch_size", default=500, type=int)
-    parser.add_argument("--latent_size", default=256, type=int)
-    parser.add_argument("--num_channels", default=64, type=int)
-    parser.add_argument("--kernel_size", default=3, type=int)
-    parser.add_argument("--print_freq", default=1000, type=int)
-    parser.add_argument("--epochs", default=100, type=int)
-    parser.add_argument("--lr", default=0.001, type=float)
-    parser.add_argument("--wd", default=0.0, type=float)
-    parser.add_argument("--dropout", default=0, type=float)
-    parser.add_argument("--act", default='gelu', type=str, help='relu, leaky-relu, elu, selu, gelu, swish, mish')
-    parser.add_argument("--beta", default=0.01, type=float)
-    parser.add_argument("--beta_mult", default=1.05, type=float)
-    parser.add_argument("--sample", dest="sample", help="generate an image from a random latent vector", action="store_true")
-    parser.add_argument("--evaluate", dest="evaluate", help="use pretrained model to reconstruct 4 images", action="store_true")
-    parser.add_argument("--train", dest="train", help="train model", action="store_true")
-    parser.add_argument("--variational", dest="variational", help="use simple autoencoder, not variational", action="store_true")
-    parser.add_argument("--sigmoid", dest="sigmoid", help="apply sigmoid at the end", action="store_true")
-    parser.add_argument("--mse", dest="mse", help="ise MSE loss instead of KL loss", action="store_true")
-    parser.add_argument("--no_pool", dest="no_pool", help="don't use max pooling for downsampling, use stride=2 conv", action="store_true")
-    parser.add_argument("--no_upsample", dest="no_upsample", help="don't use nn.Upsample for upsampling, use deconv", action="store_true")
-    parser.add_argument("--interpolation", default="nearest", type=str, help=f"upsample interpolation mode in the decoder, "
-                        f"'nearest', 'linear', 'bilinear', 'bicubic' and 'trilinear'")
-    
-    return parser
-    
-
-parser = get_args_parser()
-args = get_args_parser().parse_args()
-# use below for inline vscode cell execution
-# args, unknown = parser.parse_known_args()
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-train_dataloader, test_dataloader = get_cifar(
-    data_dir=args.data_dir, 
-    train_batch_size=args.train_batch_size, 
-    test_batch_size=args.test_batch_size
-    )
-
-# load images from disk for plotting (otherwise train images are randomly picked every time)
-if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examples.pth'):
-    train_input_images = torch.load('data/train_examples.pth')
-    test_input_images = torch.load('data/test_examples.pth')
-else:
-    train_input_images = next(iter(train_dataloader))[0]
-    test_input_images = next(iter(test_dataloader))[0]
-    torch.save(train_input_images, 'data/train_examples.pth')
-    torch.save(test_input_images, 'data/test_examples.pth')
-    
-if test_input_images.shape[0] < args.latent_size:  # number of images should be >= number of features (to compute FID)
-    print(f'\n\nNumber of test images {test_input_images.shape[0]} should be >= number of '
-          f'features {args.latent_size} in order to compute FID properly (only applies to VAE)\n\n')
-    if args.variational:
-        raise(SystemExit)
-
-args.act_fn = get_activation_function(act_str=args.act)
-
-
-if args.checkpoint is not None:
-    print(f'\n\nLoading model checkpoint from {args.checkpoint}')
-    checkpoint = torch.load(args.checkpoint)
-    saved_args = checkpoint['args']
-
-    print(f'\n\nCurrent arguments:\n')
-    for current_arg in vars(args):
-        print(current_arg, getattr(args, current_arg))
-    print(f'\n\nCheckpoint arguments:\n') 
-    for saved_arg in vars(saved_args):
-        print(saved_arg, getattr(saved_args, saved_arg))
-
-
-model = Autoencoder(
-    variational=args.variational, 
-    latent_size=args.latent_size, 
-    num_channels=args.num_channels,
-    kernel_size=args.kernel_size,
-    act=args.act_fn,
-    sigmoid=args.sigmoid, 
-    interpolation=args.interpolation,
-    no_pool=args.no_pool,
-    no_upsample=args.no_upsample,
-    device=device,
-    debug=args.debug,
-    ).to(device)
-
-# train see https://github.com/orybkin/sigma-vae-pytorch
-
-if args.loss == 'mse':
-    reconstruction_loss = nn.MSELoss()
-elif args.loss == 'bce':
-    reconstruction_loss = nn.BCELoss()
-
-beta = args.beta
-init_epoch = 0
-num_train_batches = len(train_dataloader)
-num_test_batches = len(test_dataloader)
-        
-if args.variational:
-    model_type = f'vae_{args.beta}x{args.beta_mult}'
-    if os.path.isfile(args.ae_checkpoint):
-        print(f'\n\nLoading pretrained VAE for FID computation from {args.ae_checkpoint}')
-        plain_ae = torch.load(args.ae_checkpoint)
-    else:
-        print(f'\n\nTo compute FID score using a plain autoencoder, provide valid path to checkpoint, or train one:')
-        print(f'\n\npython main.py --latent_size 256 --sigmoid --wd 0.01 --epochs 100 --train --no_upsample --no_pool\n\n')
-        raise(SystemExit)
-    
-    if args.classifier_checkpoint is None:
-        classifier_checkpoint = f'checkpoints/cifar_classifier_{args.latent_size}.pth'
-    print(f'\n\nInstantiating Classifier for FID computation')
-    if os.path.isfile(classifier_checkpoint):
-        print(f'\n\nFound checkpoint at {classifier_checkpoint}, loading...')
-        classifier = torch.load(classifier_checkpoint)
-        test_acc = evaluate_classifier(classifier, test_dataloader=test_dataloader, device=device)
-        print(f'\n\nCIFAR-10 Test Accuracy {test_acc:.2f}')
-    else:
-        print(f'\n\nClassifier checkpoint is not found at {classifier_checkpoint}')
-        classifier = train_classifier(args, classifier=None, train_dataloader=train_dataloader, test_dataloader=test_dataloader, device=device)
-        
-    if isinstance(plain_ae, dict) or isinstance(classifier, dict):
-        raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
-else:
-    model_type = 'plain-ae'
-    
-optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(train_dataloader))
-
-if args.checkpoint is not None:
-    model.load_state_dict(checkpoint['state_dict'])
-    optim.load_state_dict(checkpoint['optimizer'])
-    lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-    init_epoch = checkpoint['epoch']
-    beta = checkpoint['current_beta']
-    
-pool_str = 'pool-stride' if args.no_pool else 'pool-max'
-upsample_str = 'upsample-deconv' if args.no_upsample else f'upsample-{args.interpolation}'
-    
-experiment_str = args.tag + f'{model_type}_latent{args.latent_size}_chan{args.num_channels}_{pool_str}_{upsample_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
-print(f'\n\n{experiment_str}')
-
-if args.log_tb:
-    # launch with 'tensorboard --host 0.0.0.0 --logdir args.tb_dir' on the gateway and go to gateway_ip:6006
-    writer = SummaryWriter(args.tb_dir + '/' + experiment_str)
-    # TODO should we save this writer to checkpoints?
-else:
-    writer = None
-    
-if args.evaluate:
-    print(f'\n\nEvaluating model')
-    plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
-    plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
-    print(f'\n\nPlots saved to plots/{experiment_str}_train-test.png\n\n')
-    
-if args.sample:
-    print(f'\n\nSampling 8 images from a random latent vector')
-    model.sample(name=experiment_str)
-    print(f'\n\nPlot saved to plots/samples_{experiment_str}.png\n\n')
-    
 def train_one_epoch(args, model, epoch=None, beta=None, train_dataloader=None, optim=None, lr_scheduler=None, device=None, writer=None):
     model.train()
     total_train_rec_loss = 0
     total_train_kl_loss = 0
-    total_train_loss = 0
     count = 0
     
     for image, label in train_dataloader:
@@ -289,106 +117,236 @@ def compute_metrics(autoencoder=None, classifier=None, real_images=None, samples
     fid_classifier = compute_fid(model=classifier, images1=real_images, images2=samples)
     confidence, diversity = compute_inception_score(classifier, samples, debug=debug)   
     return fid_classifier, fid_ae, confidence, diversity
-    
-    
-if args.train:
-    if args.variational:
-        fid_classifier, fid_ae, confidence, diversity = compute_metrics(
-            autoencoder=plain_ae, 
-            classifier=classifier, 
-            real_images=train_input_images, 
-            samples=test_input_images, 
-            debug=True,
-        )
-        ref_metrics_str = f'Reference (real images) metrics:  FID (classifier/AE): ' + \
-                          f'{fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}\n\n'
-    else:
-        ref_metrics_str = ''
-    
-    print(f'\n\nTraining {model_type} model on CIFAR-10 images\n\n{ref_metrics_str}')
-    
-    for epoch in range(init_epoch, args.epochs, 1):
-        beta, avg_train_rec_loss, avg_train_kl_loss = train_one_epoch(
-            args,
-            model, 
-            epoch=epoch,
-            beta=beta, 
-            train_dataloader=train_dataloader, 
-            optim=optim, 
-            lr_scheduler=lr_scheduler,
-            device=device,
-            writer=writer,
+
+
+def main(args):
+    # use below for inline vscode cell execution
+    # parser = get_args_parser()
+    # args, unknown = parser.parse_known_args()
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    train_dataloader, test_dataloader = get_cifar(
+        data_dir=args.data_dir, 
+        train_batch_size=args.train_batch_size, 
+        test_batch_size=args.test_batch_size
         )
 
-        avg_latent_mean, avg_latent_std, avg_test_rec_loss, avg_test_kl_loss = compute_test_loss(
-            args, 
-            model, 
-            beta=beta, 
-            test_dataloader=test_dataloader, 
-            device=device,
-        )
-        avg_test_loss = avg_test_rec_loss + avg_test_kl_loss if args.variational else avg_test_rec_loss
-           
+    # load images from disk for plotting (otherwise train images are randomly picked every time)
+    if os.path.isfile('data/train_examples.pth') and os.path.isfile('data/test_examples.pth'):
+        train_input_images = torch.load('data/train_examples.pth')
+        test_input_images = torch.load('data/test_examples.pth')
+    else:
+        train_input_images = next(iter(train_dataloader))[0]
+        test_input_images = next(iter(test_dataloader))[0]
+        torch.save(train_input_images, 'data/train_examples.pth')
+        torch.save(test_input_images, 'data/test_examples.pth')
+        
+    if test_input_images.shape[0] < args.latent_size:  # number of images should be >= number of features (to compute FID)
+        print(f'\n\nNumber of test images {test_input_images.shape[0]} should be >= number of '
+            f'features {args.latent_size} in order to compute FID properly (only applies to VAE)\n\n')
         if args.variational:
-            samples = model.sample(num_images=args.test_batch_size, return_samples=True)
+            raise(SystemExit)
+
+    args.act_fn = get_activation_function(act_str=args.act)
+
+
+    if args.checkpoint is not None:
+        print(f'\n\nLoading model checkpoint from {args.checkpoint}')
+        checkpoint = torch.load(args.checkpoint)
+        saved_args = checkpoint['args']
+
+        print(f'\n\nCurrent arguments:\n')
+        for current_arg in vars(args):
+            print(current_arg, getattr(args, current_arg))
+        print(f'\n\nCheckpoint arguments:\n') 
+        for saved_arg in vars(saved_args):
+            print(saved_arg, getattr(saved_args, saved_arg))
+
+
+    model = Autoencoder(
+        variational=args.variational, 
+        latent_size=args.latent_size, 
+        num_channels=args.num_channels,
+        kernel_size=args.kernel_size,
+        act=args.act_fn,
+        sigmoid=args.sigmoid, 
+        interpolation=args.interpolation,
+        no_pool=args.no_pool,
+        no_upsample=args.no_upsample,
+        device=device,
+        debug=args.debug,
+        ).to(device)
+
+    # train see https://github.com/orybkin/sigma-vae-pytorch
+
+    beta = args.beta
+    init_epoch = 0
+            
+    if args.variational:
+        model_type = f'vae_{args.beta}x{args.beta_mult}'
+        if os.path.isfile(args.ae_checkpoint):
+            print(f'\n\nLoading pretrained VAE for FID computation from {args.ae_checkpoint}')
+            plain_ae = torch.load(args.ae_checkpoint)
+        else:
+            print(f'\n\nTo compute FID score using a plain autoencoder, provide valid path to checkpoint, or train one:')
+            print(f'\n\npython main.py --latent_size 256 --sigmoid --wd 0.01 --epochs 100 --train --no_upsample --no_pool\n\n')
+            raise(SystemExit)
+        
+        if args.classifier_checkpoint is None:
+            classifier_checkpoint = f'checkpoints/cifar_classifier_{args.latent_size}.pth'
+        print(f'\n\nInstantiating Classifier for FID computation')
+        if os.path.isfile(classifier_checkpoint):
+            print(f'\n\nFound checkpoint at {classifier_checkpoint}, loading...')
+            classifier = torch.load(classifier_checkpoint)
+            test_acc = evaluate_classifier(classifier, test_dataloader=test_dataloader, device=device)
+            print(f'\n\nCIFAR-10 Test Accuracy {test_acc:.2f}')
+        else:
+            print(f'\n\nClassifier checkpoint is not found at {classifier_checkpoint}')
+            classifier = train_classifier(args, classifier=None, train_dataloader=train_dataloader, test_dataloader=test_dataloader, device=device)
+            
+        if isinstance(plain_ae, dict) or isinstance(classifier, dict):
+            raise NotImplementedError('\n\nmodel checkpoint must be a full saved model, not a state_dict\n\n')
+    else:
+        model_type = 'plain-ae'
+        
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs * len(train_dataloader))
+
+    if args.checkpoint is not None:
+        model.load_state_dict(checkpoint['state_dict'])
+        optim.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        init_epoch = checkpoint['epoch']
+        beta = checkpoint['current_beta']
+        
+    pool_str = 'pool-stride' if args.no_pool else 'pool-max'
+    upsample_str = 'upsample-deconv' if args.no_upsample else f'upsample-{args.interpolation}'
+        
+    experiment_str = args.tag + f'{model_type}_latent{args.latent_size}_chan{args.num_channels}_{pool_str}_{upsample_str}_bs{args.train_batch_size}_lr{args.lr}_wd{args.wd}_e{args.epochs}'
+    print(f'\n\n{experiment_str}')
+
+    if args.log_tb:
+        # launch with 'tensorboard --host 0.0.0.0 --logdir args.tb_dir' on the gateway and go to gateway_ip:6006
+        writer = SummaryWriter(args.tb_dir + '/' + experiment_str)
+        # TODO should we save this writer to checkpoints?
+    else:
+        writer = None
+        
+    if args.evaluate:
+        print(f'\n\nEvaluating model')
+        plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
+        plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
+        print(f'\n\nPlots saved to plots/{experiment_str}_train-test.png\n\n')
+        
+    if args.sample:
+        print(f'\n\nSampling 8 images from a random latent vector')
+        model.sample(name=experiment_str)
+        print(f'\n\nPlot saved to plots/samples_{experiment_str}.png\n\n')
+        
+    if args.train:
+        if args.variational:
             fid_classifier, fid_ae, confidence, diversity = compute_metrics(
                 autoencoder=plain_ae, 
                 classifier=classifier, 
-                real_images=test_input_images, 
-                samples=samples, 
+                real_images=train_input_images, 
+                samples=test_input_images, 
                 debug=True,
             )
-            metrics_str = f'  FID (classifier/AE): {fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}'
+            ref_metrics_str = f'Reference (real images) metrics:  FID (classifier/AE): ' + \
+                            f'{fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}\n\n'
         else:
-            metrics_str = ''
-            
-        if writer is not None:
-            i = epoch * len(train_dataloader)
-            writer.add_scalar('Test Loss/KL', avg_test_kl_loss, i)
-            writer.add_scalar('Test Loss/Reconstruction', avg_test_rec_loss, i)
-            writer.add_scalar('Test Loss/Total', avg_test_loss, i)
-            writer.add_scalar('Latent Vector/mean', avg_latent_mean, i)
-            writer.add_scalar('Latent Vector/std', avg_latent_std, i)
-            writer.add_scalar('FID/classifier', fid_classifier, i)
-            writer.add_scalar('FID/plain_ae', fid_ae, i)
-            writer.add_scalar('Metrics/confidence', confidence, i)
-            writer.add_scalar('Metrics/diversity', diversity, i)
-            
-        latent_stats_str = f'  mean {avg_latent_mean:.4f} std {avg_latent_std:.4f}' if args.variational else ''    
-        kl_loss_str = f'  kl train {1000*avg_train_kl_loss:.2f} test {1000*avg_test_kl_loss:.2f}' if args.variational else ''
-        loss_str = f'losses:  train {1000*avg_train_rec_loss:.2f} test {1000*avg_test_rec_loss:.2f}{kl_loss_str}'
-        changes_str = f'  LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.6f}' if args.variational else '')
-        time_str = f'{str(datetime.now())[:-7]}'
-        print(f'{time_str}  Epoch {epoch:>3d}   {loss_str}{latent_stats_str}{metrics_str}{changes_str}')
+            ref_metrics_str = ''
         
-        plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
-        plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
+        print(f'\n\nTraining {model_type} model on CIFAR-10 images\n\n{ref_metrics_str}')
+        
+        for epoch in range(init_epoch, args.epochs, 1):
+            beta, avg_train_rec_loss, avg_train_kl_loss = train_one_epoch(
+                args,
+                model, 
+                epoch=epoch,
+                beta=beta, 
+                train_dataloader=train_dataloader, 
+                optim=optim, 
+                lr_scheduler=lr_scheduler,
+                device=device,
+                writer=writer,
+            )
+
+            avg_latent_mean, avg_latent_std, avg_test_rec_loss, avg_test_kl_loss = compute_test_loss(
+                args, 
+                model, 
+                beta=beta, 
+                test_dataloader=test_dataloader, 
+                device=device,
+            )
+            avg_test_loss = avg_test_rec_loss + avg_test_kl_loss if args.variational else avg_test_rec_loss
+            
+            if args.variational:
+                samples = model.sample(num_images=args.test_batch_size, return_samples=True)
+                fid_classifier, fid_ae, confidence, diversity = compute_metrics(
+                    autoencoder=plain_ae, 
+                    classifier=classifier, 
+                    real_images=test_input_images, 
+                    samples=samples, 
+                    debug=True,
+                )
+                metrics_str = f'  FID (classifier/AE): {fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}'
+            else:
+                metrics_str = ''
                 
-        # checkpointing:
-        checkpoint = {}
-        checkpoint['state_dict'] = model.state_dict()
-        checkpoint['optimizer'] = optim.state_dict()
-        checkpoint['lr_scheduler'] = lr_scheduler.state_dict() 
-        checkpoint['epoch'] = epoch
-        checkpoint['args'] = args
-        checkpoint['current_beta'] = beta
-        checkpoint['losses'] = loss_str
+            if writer is not None:
+                i = epoch * len(train_dataloader)
+                writer.add_scalar('Test Loss/KL', avg_test_kl_loss, i)
+                writer.add_scalar('Test Loss/Reconstruction', avg_test_rec_loss, i)
+                writer.add_scalar('Test Loss/Total', avg_test_loss, i)
+                writer.add_scalar('Test Loss/beta', beta, i)
+                writer.add_scalar('Latent Vector/mean', avg_latent_mean, i)
+                writer.add_scalar('Latent Vector/std', avg_latent_std, i)
+                writer.add_scalar('FID/classifier', fid_classifier, i)
+                writer.add_scalar('FID/plain_ae', fid_ae, i)
+                writer.add_scalar('Metrics/confidence', confidence, i)
+                writer.add_scalar('Metrics/diversity', diversity, i)
+                
+            latent_stats_str = f'  mean {avg_latent_mean:.4f} std {avg_latent_std:.4f}' if args.variational else ''    
+            kl_loss_str = f'  kl train {1000*avg_train_kl_loss:.2f} test {1000*avg_test_kl_loss:.2f}' if args.variational else ''
+            loss_str = f'losses:  train {1000*avg_train_rec_loss:.2f} test {1000*avg_test_rec_loss:.2f}{kl_loss_str}'
+            changes_str = f'  LR {lr_scheduler.get_last_lr()[0]:.5f}' + (f' beta {beta:.6f}' if args.variational else '')
+            time_str = f'{str(datetime.now())[:-7]}'
+            print(f'{time_str}  Epoch {epoch:>3d}   {loss_str}{latent_stats_str}{metrics_str}{changes_str}')
+            
+            plot_grid(model, train_input_images[:4], name=experiment_str+'_train')
+            plot_grid(model, test_input_images[:4], name=experiment_str+'_test')
+                    
+            # checkpointing:
+            checkpoint = {}
+            checkpoint['state_dict'] = model.state_dict()
+            checkpoint['optimizer'] = optim.state_dict()
+            checkpoint['lr_scheduler'] = lr_scheduler.state_dict() 
+            checkpoint['epoch'] = epoch
+            checkpoint['args'] = args
+            checkpoint['current_beta'] = beta
+            checkpoint['losses'] = loss_str
+            
+            path = 'checkpoints/' + experiment_str + ".pth"
+            torch.save(checkpoint, path)
+            
+            model.sample(name=experiment_str)
         
-        path = 'checkpoints/' + experiment_str + ".pth"
-        torch.save(checkpoint, path)
-        
-        model.sample(name=experiment_str)
+        if not os.path.isfile(args.ae_checkpoint):  # save full model checkpoint 
+            torch.save(model, 'checkpoints/' + experiment_str + "_full_model.pth")
+
+
+if __name__ is "__main__":
+    args = get_args_parser().parse_args()
+    main(args)
     
-    if not os.path.isfile(args.ae_checkpoint):  # save full model checkpoint 
-        torch.save(model, 'checkpoints/' + experiment_str + "_full_model.pth")
+    # TODO:
+    # 2. Inception Score - official one
+    # 3. Tensorboard support - DONE
+    # 5. save logs of train output
+    # 6. add CelebA dataset
 
-
-# TODO:
-# 2. Inception Score - official one
-# 3. Tensorboard support - DONE
-# 5. save logs of train output
-# 6. add CelebA dataset
-
-# add vae-vq
-# implement MUSIQ
-# add larger models (resnets)
+    # add vae-vq
+    # implement MUSIQ
+    # add larger models (resnets)
