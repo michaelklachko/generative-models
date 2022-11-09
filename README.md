@@ -13,4 +13,4 @@ Train a small plain autoencoder with latent vector size 256 on cifar-10 images f
 Train a small VAE on cifar-10 images, generates samples, computes metrics (FID, inception score, etc), logs data for tensorboard, etc) 
 `python main.py --latent_size 256 --sigmoid --wd 0.01 --epochs 100 --train --variational --beta 5e-6 --no_upsample --no_pool --beta_mult 1 --tag test_tag_`
 
-This assumes a plain autoencoder has already been trained (see above) and the corresponding checkpoint is available in checkpoints folder (saved automatically)
+This assumes a plain autoencoder (used for FID computation) has already been trained (see above) and the corresponding checkpoint is available in checkpoints folder (saved automatically)
