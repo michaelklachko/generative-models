@@ -15,6 +15,11 @@ def print_debug(x, debug=False, name=''):
         print(f'{name} shape: {list(x.shape)}\n\tvalues: {x.flatten()[:8]}')
         
         
+def make_folder(name):
+    if not os.path.isdir(name):
+        os.mkdir(name)
+        
+        
 def plot_image(image, name='image.png'):
     image = image.squeeze(0).permute(1,2,0)
     image = image - image.min()

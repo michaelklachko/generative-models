@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from dataloaders import get_cifar
-from utils import get_activation_function, plot_grid
+from utils import get_activation_function, plot_grid, make_folder
 from models.classifiers import evaluate_classifier, train_classifier
 from models.autoencoders import Autoencoder
 from metrics import compute_fid, compute_inception_score
@@ -120,9 +120,9 @@ def compute_metrics(autoencoder=None, classifier=None, real_images=None, samples
 
 
 def main(args):
-    # use below for inline vscode cell execution
-    # parser = get_args_parser()
-    # args, unknown = parser.parse_known_args()
+    # create necessary directories as needed
+    for dir_name in ['test', 'checkpoints', 'data', 'plots', 'logs']:
+        make_folder(dir_name)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -337,7 +337,10 @@ def main(args):
             torch.save(model, 'checkpoints/' + experiment_str + "_full_model.pth")
 
 
-if __name__ is "__main__":
+if __name__ == "__main__":
+    # use below for inline vscode cell execution
+    # parser = get_args_parser()
+    # args, unknown = parser.parse_known_args()
     args = get_args_parser().parse_args()
     main(args)
     
