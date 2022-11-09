@@ -4,7 +4,9 @@ Pytorch implementation of popular generative models (early work in progress)
 ## Goal 
 Learn about generative models and apply them to music generation (in raw waveform domain)
 
-## Usage
+## Usage  
+See `arguments.py` for explanation of CLI arguments and default values.
+
 Train a small plain autoencoder with latent vector size 256 on cifar-10 images for 100 epochs:
 `python main.py --latent_size 256 --sigmoid --wd 0.01 --epochs 100 --train --no_upsample --no_pool`
 
