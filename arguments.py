@@ -10,7 +10,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--classifier_checkpoint", default=None, type=str, help="path to classifier checkpoint")
     parser.add_argument("--tag", default="", type=str, help="string to prepend when saving checkpoints")
     parser.add_argument("--debug", dest="debug", help="print out shapes and values of intermediate outputs", action="store_true")
-    parser.add_argument("--log_tb", dest="log_tb", help="send selected values to tensorboard for plotting", action="store_true")
+    parser.add_argument("--log_tb", dest="log_tb", help="enable tensorboard plotting", action="store_true")
     parser.add_argument("--tb_dir", default="logs", type=str, help="path to tensorboard files")
     parser.add_argument("--loss", default="mse", type=str, help="reconstruction loss function")
     parser.add_argument("--train_batch_size", default=50, type=int)

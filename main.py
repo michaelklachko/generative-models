@@ -12,7 +12,7 @@ from dataloaders import get_cifar
 from utils import get_activation_function, plot_grid, make_folder
 from models.classifiers import evaluate_classifier, train_classifier
 from models.autoencoders import Autoencoder
-from metrics import compute_fid, compute_inception_score
+from metrics import compute_fid, compute_confidence_diversity, compute_inception_score
 from arguments import get_args_parser
 
 # replace all occurences of comma followed by non-white space character with comma+space: ,(?=[^\s])
@@ -115,13 +115,14 @@ def compute_metrics(autoencoder=None, classifier=None, real_images=None, samples
     #fid_ae_dynamic = compute_fid2(model=model_we_are_training, images1=real_images, images2=samples)
     fid_ae = compute_fid(model=autoencoder, images1=real_images, images2=samples)  # use pretrained cifar model to compute features
     fid_classifier = compute_fid(model=classifier, images1=real_images, images2=samples)
-    confidence, diversity = compute_inception_score(classifier, samples, debug=debug)   
-    return fid_classifier, fid_ae, confidence, diversity
+    confidence, diversity = compute_confidence_diversity(classifier, samples, debug=debug)
+    inception_score = compute_inception_score(classifier=classifier, images=samples)
+    return fid_classifier, fid_ae, confidence, diversity, inception_score
 
 
 def main(args):
     # create necessary directories as needed
-    for dir_name in ['test', 'checkpoints', 'data', 'plots', 'logs']:
+    for dir_name in ['checkpoints', 'data', 'plots', 'logs']:
         make_folder(dir_name)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -246,7 +247,7 @@ def main(args):
         
     if args.train:
         if args.variational:
-            fid_classifier, fid_ae, confidence, diversity = compute_metrics(
+            fid_classifier, fid_ae, confidence, diversity, inception_score = compute_metrics(
                 autoencoder=plain_ae, 
                 classifier=classifier, 
                 real_images=train_input_images, 
@@ -254,7 +255,7 @@ def main(args):
                 debug=True,
             )
             ref_metrics_str = f'Reference (real images) metrics:  FID (classifier/AE): ' + \
-                            f'{fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}\n\n'
+                            f'{fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}  IS {inception_score:.3f}\n\n'
         else:
             ref_metrics_str = ''
         
@@ -284,14 +285,14 @@ def main(args):
             
             if args.variational:
                 samples = model.sample(num_images=args.test_batch_size, return_samples=True)
-                fid_classifier, fid_ae, confidence, diversity = compute_metrics(
+                fid_classifier, fid_ae, confidence, diversity, inception_score = compute_metrics(
                     autoencoder=plain_ae, 
                     classifier=classifier, 
                     real_images=test_input_images, 
                     samples=samples, 
                     debug=True,
                 )
-                metrics_str = f'  FID (classifier/AE): {fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}'
+                metrics_str = f'  FID (classifier/AE): {fid_classifier:.1f}/{fid_ae:.1f}  confidence {confidence:.1f}  diversity {diversity:.1f}  IS {inception_score:.2f}'
             else:
                 metrics_str = ''
                 
@@ -307,6 +308,7 @@ def main(args):
                 writer.add_scalar('FID/plain_ae', fid_ae, i)
                 writer.add_scalar('Metrics/confidence', confidence, i)
                 writer.add_scalar('Metrics/diversity', diversity, i)
+                writer.add_scalar('Metrics/inception score', inception_score, i)
                 
             latent_stats_str = f'  mean {avg_latent_mean:.4f} std {avg_latent_std:.4f}' if args.variational else ''    
             kl_loss_str = f'  kl train {1000*avg_train_kl_loss:.2f} test {1000*avg_test_kl_loss:.2f}' if args.variational else ''
@@ -345,7 +347,7 @@ if __name__ == "__main__":
     main(args)
     
     # TODO:
-    # 2. Inception Score - official one
+    # 2. Inception Score - DONE
     # 3. Tensorboard support - DONE
     # 5. save logs of train output
     # 6. add CelebA dataset

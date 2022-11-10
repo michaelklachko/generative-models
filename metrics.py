@@ -107,9 +107,9 @@ def compute_fid(model=None, images1=None, images2=None, eps=1e-6):
 
     return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
 
-def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
+def compute_confidence_diversity(classifier, images, N=3, alpha=0.7, debug=False):
     """
-    Inception Score measures:
+    Implements components of the original Inception Score idea:
     - classifier confidence in detected objects in an image
     - diversity of detected objects in a batch of images
     
@@ -135,7 +135,7 @@ def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
     interest (class probabilities or class ID frequencies)
     """
     
-    # images shape: (batch_size, latent_size)
+    # images shape: (batch_size, 3, 32, 32)
     device = images.device
     classifier = classifier.to(device)
     classifier.eval()
@@ -199,3 +199,69 @@ def compute_inception_score(classifier, images, N=3, alpha=0.7, debug=False):
         diversity_score2 = 1 - class_frequencies.std() / min_diversity_batch.std()
         
     return 100*confidence_score, 100*diversity_score2
+
+
+def compute_inception_score(classifier, images, eps=1e-7):
+    """
+    IS = exp(E[KL(confidence, diversity)]), where 
+    confidence is the entropy of output distribution for a single image, and 
+    diversity is the entropy of the prediction distribution in a batch of images
+    entropy H(x) = -Sum(p(x)*log(p(x)) for all possible outcomes x of random variable X (for continuous valued X use integral)
+    for entropy in bits, use log with base 2. For example, if p(x) = 0.5, H(x) = - 2 * 0.5 * log2(2^-1) = -1 * -1 * 1 = 1 bit
+    
+    entropy of confidence should be low, entropy of diversity should be high
+    
+    IS = exp(H(diversity) - H(confidence))  
+    
+    IS = exp[(p_d*log(p_d)).sum().mean() - (p_c*log(p_c)).sum().mean()], where p_d is the distribution of highest outputs from each image in a batch, and
+    p_c is the distribution of outputs for a single image
+    
+    in the official implementation, p_d is computed as an average of all p_c values in the batch (instead of class frequencies)
+    
+    inputs: 
+    classifier: should be trained to classify the same image objects as what we are trying to generate
+    images: generated samples we want to evaluate
+    """
+    
+    device = images.device
+    classifier = classifier.to(device)
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(images)
+        predictions = torch.softmax(logits, dim=1)  # predictions shape: (batch_size, num_classes)
+        
+    # my initial attempt to compute marginal distribution:
+    # num_classes = predictions.shape[1]
+    # predicted_class_ids = torch.argmax(predictions, dim=1)  # should be vector of class ids
+    
+    # class_frequencies = [0] * num_classes
+    # for class_id in predicted_class_ids:
+    #     class_frequencies[class_id] += 1
+
+    # class_frequencies = torch.tensor(class_frequencies, dtype=torch.float, device=device)
+    # norm_class_frequencies = class_frequencies/class_frequencies.max()
+    # class_frequencies = torch.softmax(norm_class_frequencies, dim=0)
+      
+    # unit tests:
+    #values = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]           # IS should be 3
+    #values = [[0.33, 0.33, 0.33], [0.33, 0.33, 0.33], [0.33, 0.33, 0.33]]  # IS should be 1
+    #predictions = torch.tensor(values, dtype=torch.float, device=device)
+    
+    # the below is a more intuitive way to compute IS:
+    confidence_entropy = -(predictions * torch.log(predictions+eps)).sum(1).mean()
+    class_frequencies = predictions.mean(0)  # needs many images to approximate the marginal distribution
+    diversity_entropy = -(class_frequencies * torch.log(class_frequencies+eps)).sum()
+    inception_score = torch.exp(diversity_entropy - confidence_entropy)
+    
+    # the paper https://arxiv.org/pdf/1606.03498.pdf uses this formula: 
+    # inception_score = exp(E(KL(confidence, diversity)))
+    # KL(confidence || diversity) = Sum(confidence * log(confidence/diversity)) 
+    
+    # class_frequencies = class_frequencies.unsqueeze(0)  # --> (1, num_classes)
+    # kl_div = predictions * (torch.log(predictions+eps) - torch.log(class_frequencies+eps))
+    # kl_div = kl_div.sum(1).mean()
+    # inception_score = torch.exp(kl_div)
+    # should be equivalent to the above:
+    # (predictions * torch.log(predictions+eps)).sum(1).mean() - (predictions.mean(0) * torch.log(predictions.mean(0)+eps)).sum()
+    
+    return inception_score
